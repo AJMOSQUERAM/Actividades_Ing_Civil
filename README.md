@@ -1,7 +1,8 @@
-# Registro diario de labores de maquinaria
+# Registro diario de actividades de ingeniería civil
 
-Tablero en Streamlit que consulta los registros de labores de maquinaria
-capturados por un bot de Telegram. Es una aplicación de **sólo lectura**: no
+Tablero en Streamlit que consulta los registros diarios del área de ingeniería
+civil capturados por un bot de Telegram: labores, cuentas control, novedades,
+uso de herramientas y vacaciones. Es una aplicación de **sólo lectura**: no
 escribe nada en la base de datos.
 
 Todo el tablero vive en un único archivo, [app.py](app.py).
@@ -11,17 +12,21 @@ Todo el tablero vive en un único archivo, [app.py](app.py).
 ## Arquitectura
 
 ```
-Operador (Telegram)
+Colaborador (Telegram)
       │
       ▼
    Flujo n8n ──────────► Supabase / Postgres
-                          ├── registro_labores_maquinaria   (registros del bot)
-                          ├── actividades                   (maestra de labores)
-                          └── Maestro_Equipos_Zonas         (maestra de equipos)
+                          ├── civil_registros    (labores, cuentas control, novedades)
+                          └── civil_vacaciones   (vacaciones)
                                     │
                                     ▼
                           app.py (Streamlit)
 ```
+
+A diferencia del tablero de maquinaria, **no hay cruces con tablas maestras**:
+el bot guarda en cada registro la descripción de la labor, la hacienda y la
+herramienta en el momento de capturarlo, así que la app no depende de
+`actividades` ni de `Maestro_Equipos_Zonas`.
 
 Dos identidades distintas tocan la base de datos:
 
@@ -40,21 +45,22 @@ cada consulta.
 
 Streamlit re-ejecuta `app.py` completo en cada interacción. El orden importa:
 
-1. **Configuración** — `_config()` resuelve las variables de entorno.
-2. **Autenticación** — `token_activo()`. Sin token válido se dibuja
+1. **Configuración**: `_config()` resuelve las variables de entorno.
+2. **Autenticación**: `token_activo()`. Sin token válido se dibuja
    `pantalla_ingreso()` y `st.stop()` corta ahí.
-3. **Carga** — `obtener_datos(usuario_id, token)` → `cargar_registros()`
-   (cacheada).
-4. **Normalización** — `normalizar()` convierte tipos y deriva columnas.
-5. **Enriquecimiento** — `agregar_actividades()` traduce el código de labor y
-   `agregar_zonas()` cruza el equipo contra la maestra para traer zona y
-   descripción.
-6. **Validación** — `marcar_alertas()` produce la matriz booleana de reglas.
-7. **Filtros** — Zona y Hacienda (sobre el selector de vista) más Operador,
-   Suerte, Actividad y Equipo (barra lateral) recortan el DataFrame a
+3. **Carga**: `obtener_datos()` → `cargar_registros()` y `obtener_vacaciones()`
+   → `cargar_vacaciones()` (ambas cacheadas).
+4. **Normalización**: `normalizar()` convierte tipos, traduce las claves internas
+   del bot y deriva `actividad`, `codigo` y `clasificacion`.
+5. **Herramientas**: `agregar_herramientas()` expande el arreglo `herramientas`
+   a una tabla larga (una fila por herramienta) y resume cada registro.
+6. **Validación**: `marcar_alertas()` produce la matriz booleana de reglas,
+   incluido el cruce contra vacaciones.
+7. **Filtros**: Clasificación y Hacienda (sobre el selector de vista) más
+   Colaborador, Actividad y Herramienta (barra lateral) recortan el DataFrame a
    `filtrados`.
-8. **Render** — una sola vista de las tres (Detalle, Resumen, Calidad de
-   datos), elegida con `st.segmented_control`.
+8. **Render**: una sola vista de las cuatro (Detalle, Resumen, Vacaciones,
+   Calidad de datos), elegida con `st.segmented_control`.
 
 Todo lo que se dibuja parte de `filtrados`; `datos` conserva el conjunto
 completo para los contadores del encabezado.
@@ -74,9 +80,8 @@ que una variable con otro nombre entrara sin que nadie lo note.
 |---|---|---|
 | `SUPABASE_URL` | sí | — |
 | `SUPABASE_KEY` | sí | — |
-| `SUPABASE_TABLE` | no | `registro_labores_maquinaria` |
-| `SUPABASE_ACTIVIDADES_TABLE` | no | `actividades` |
-| `SUPABASE_ZONAS_TABLE` | no | `Maestro_Equipos_Zonas` |
+| `SUPABASE_TABLE` | no | `civil_registros` |
+| `SUPABASE_VACACIONES_TABLE` | no | `civil_vacaciones` |
 
 Si faltan `SUPABASE_URL` o `SUPABASE_KEY`, la app se detiene con un mensaje antes
 de dibujar nada.
@@ -126,17 +131,10 @@ Supabase; no forman parte de este repositorio.
 
 ### Alcance
 
-Todo usuario autenticado lee todos los registros. La **zona es un filtro de
-visualización**, sobre el selector de vista, no un permiso: sirve para que cada persona
-se concentre en su área, no para impedirle ver las demás.
-
-La restricción por usuario quedó preparada pero no activa. Está documentada en
-la sección 8 de `supabase_politicas_lectura.sql`: una política que cruza el
-equipo del registro contra `Maestro_Equipos_Zonas` y lo compara con el arreglo
-`zonas` del `app_metadata` del usuario, leído del token. Se dejó fuera porque
-falla cerrado — quien no tenga zona asignada no vería ninguna fila —, y eso
-bloquearía a los usuarios aún sin mapear. Para activarla hay que asignar primero
-la zona a todos (`supabase_asignar_zonas.sql`) y después cambiar la política.
+Todo usuario autenticado lee todos los registros y todas las vacaciones. Las
+políticas están en `supabase_politicas_civil.sql` (local, no se publica): activan
+RLS en `civil_registros` y `civil_vacaciones` y conceden `SELECT` al rol
+`authenticated`. El bot no se ve afectado porque escribe con `service_role`.
 
 ---
 
@@ -147,19 +145,13 @@ la zona a todos (`supabase_asignar_zonas.sql`) y después cambiar la política.
 | Función | TTL | Clave de caché |
 |---|---|---|
 | `cargar_registros` | 300 s | `(tabla, usuario_id)` |
-| `cargar_actividades` | 3600 s | `(tabla, códigos presentes, usuario_id)` |
-| `cargar_zonas` | 3600 s | `(tabla, usuario_id)` |
+| `cargar_vacaciones` | 300 s | `(tabla, usuario_id)` |
 
 El `usuario_id` forma parte de la clave para que un usuario no reciba datos
 traídos con las credenciales de otro. El **token no entra en la clave**: se pasa
 como `_token` y Streamlit ignora los argumentos que empiezan con guion bajo. Es
-deliberado — el token rota cada hora, y si formara parte de la clave invalidaría
+deliberado: el token rota cada hora, y si formara parte de la clave invalidaría
 la caché en cada rotación.
-
-`cargar_actividades` recibe la tupla de códigos que de verdad aparecen en los
-registros y los pide con `.in_()`. Traer la maestra completa son ~1600 filas en
-dos páginas (~800 ms); así es una sola petición (~190 ms). La caché se renueva
-sólo cuando aparece un código nuevo.
 
 ### Conexiones (`cache_resource`)
 
@@ -177,18 +169,19 @@ El script corre en el servidor de Streamlit, que habla con Supabase servidor a
 servidor: **la consulta no pasa por la conexión del usuario**. Por ella viaja
 sólo la interfaz renderizada, y de ahí vienen las dos decisiones de estructura:
 
-- **Una vista a la vez.** Con `st.tabs`, Streamlit construye y envía las tres
+- **Una vista a la vez.** Con `st.tabs`, Streamlit construye y envía las cuatro
   vistas en cada interacción. Con el selector se dibuja sólo la activa, así que
-  un cambio de filtro manda un tercio de lo que mandaba.
-- **Los filtros de Zona y Hacienda van arriba del selector**, no dentro de una
+  un cambio de filtro manda una cuarta parte de lo que mandaba.
+- **Los filtros de Clasificación y Hacienda van arriba del selector**, no dentro de una
   vista. Si estuvieran dentro, Streamlit descartaría su valor al cambiar de
   vista, porque el widget deja de renderizarse.
+
 
 ### Consultas
 
 `COLUMNAS_CONSULTA` limita el `SELECT` a los campos que se usan: las columnas
-internas (`id_registro`, `fecha_original`, `telegram_chat_id`,
-`telegram_usuario`) no viajan por la red.
+internas (`id`, `id_registro`, `origen`, `chat_id`) y las que el bot no llena
+(`labor_grupo`, `clase_labor`) no viajan por la red.
 
 `_descargar()` pagina de 1000 en 1000 hasta agotar la tabla, así que no depende
 del límite por defecto de PostgREST.
@@ -199,59 +192,66 @@ El botón **Actualizar datos** llama a `st.cache_data.clear()`.
 
 ## Modelo de datos
 
-### Columnas que llegan de la base
+### `civil_registros`
 
-| Columna | Tipo tras normalizar | Nota |
-|---|---|---|
-| `ficha`, `nombre_completo` | texto | Identifican al operador. |
-| `ip_equipo`, `implemento_1`, `implemento_2` | texto | Códigos de equipo. |
-| `tiene_implemento`, `tiene_observaciones` | booleano | Llegan como `"true"`/`"false"`. |
-| `cantidad_implementos` | numérico | |
-| `fecha` | datetime | Se parsea `%d/%m/%Y` y, si falla, en modo mixto con `dayfirst`. |
-| `hda`, `ste`, `labor` | **texto** | Son códigos, no números. Ver *Gráficos*. |
-| `hora_inicio`, `hora_final` | texto `HH:MM` | |
-| `horometro_inicio`, `horometro_final`, `horometro_diferencia` | numérico | |
-| `horas_trabajadas`, `area_trabajada` | numérico | Acepta coma o punto decimal. |
-| `observaciones` | texto | |
-| `registrado_en` | datetime | Llega en UTC con precisión variable (`format="ISO8601"`); se resta 5 h fijas para hora de Colombia. Se muestra como *Fecha digitación*. Ver *Fechas*. |
+Cada fila es un tramo horario de un colaborador. `tipo_registro` define qué
+columnas aplican:
 
-Las columnas internas de la tabla (`id_registro`, `fecha_original`,
-`telegram_chat_id`, `telegram_usuario`) se cargan pero nunca se muestran: la
-lista `ORDEN_COLUMNAS` define qué se ve y en qué orden.
+| `tipo_registro` | Columnas propias |
+|---|---|
+| `labor` | `labor_codigo`, `labor_desc`, `tipo_labor` y, según el tipo, `hacienda_*`, `zona_cosecha` o `cuenta_gasto` |
+| `cuenta_control` | `cuenta_control` (empieza por `160`), `cuenta_desc` |
+| `novedad` | `novedad_tipo` (`permiso_calamidad`, `permiso_cita_medica`) |
+
+Comunes a todos: `ficha`, `colaborador`, `fecha`, `hora_inicio`, `hora_fin`,
+`horas_totales`, `horas_normales`, `horas_adicionales`, `tipo_hora_adicional`
+(`extra` / `banco`) y `created_at` (*Fecha digitación*).
+
+La base ya impide varios errores, y la app no los vuelve a validar: cruces de
+horario del mismo colaborador (`sin_cruce_horario`), `hora_fin ≤ hora_inicio`,
+inicio antes de las 06:00, herramienta marcada sin IP y labor sin ubicación.
+Varias de esas restricciones son `NOT VALID`: rigen para filas nuevas, pero las
+anteriores a su creación pueden no cumplirlas.
 
 ### Columnas derivadas
 
 | Columna | Origen |
 |---|---|
-| `horas_calendario` | `hora_final − hora_inicio` en horas decimales; suma 24 si cruza medianoche. Es la referencia para contrastar `horas_trabajadas`. |
-| `clave` | Concatenación de `ficha`, `fecha`, `hora_inicio` y `labor`. Identificador estable de una fila. |
-| `actividad` | Nombre de la labor, resuelto contra la maestra. |
-| `zona`, `nombre_equipo` | Zona y descripción del equipo, resueltas contra `Maestro_Equipos_Zonas`. |
+| `actividad` | `labor_desc` en labores; `cuenta_desc` (o `Cuenta <código>`) en cuentas control; el nombre de la novedad en novedades. Un solo campo para filtrar y graficar. |
+| `codigo` | `labor_codigo` o `cuenta_control`. |
+| `clasificacion` | `Administrativa` / `Campo` / `Cosecha` para las labores; `Cuenta control` o `Novedad` para lo demás. Alimenta el filtro superior. |
+| `horas_calendario` | `hora_fin − hora_inicio` en horas decimales. Referencia para contrastar `horas_totales`. |
+| `herramientas_texto`, `horas_herramienta` | IPs usadas en el registro y suma de sus horas. |
+| `clave` | `ficha`, `fecha` y `hora_inicio`. Identifica la fila (la base garantiza que no se repite). |
 | `tiene_alerta`, `detalle_alertas` | Resumen de `marcar_alertas()`. |
 
-### Cruce con la maestra de equipos
+Las claves internas del bot (`cuenta_control`, `permiso_cita_medica`, `banco`…)
+se traducen en pantalla con los diccionarios `NOMBRES_*`.
 
-`ip_equipo` se cruza contra `Maestro_Equipos_Zonas` (`Cod_equipo` → `Zona`,
-`D_equipo`) en `agregar_zonas()`. Dos detalles del cruce:
+### Herramientas
 
-- La llave se normaliza a mayúsculas y sin espacios en ambos lados. Los códigos
-  provienen de capturas distintas y no siempre coinciden en caja.
-- El cruce es por la izquierda: un equipo ausente de la maestra **conserva su
-  registro** y queda en `Sin zona`, con el código como descripción. Nunca se
-  pierde una fila por un faltante del maestro.
+Un registro puede usar varias herramientas. El bot las guarda en el arreglo
+`jsonb` `herramientas` (`[{ip, desc, horas}, …]`); los registros anteriores a ese
+arreglo las tienen en las columnas sueltas `herramienta_ip`, `herramienta_desc`
+y `herramienta_horas`.
 
-El nombre de la tabla lleva mayúsculas y PostgREST es sensible a ellas, igual
-que sus columnas (`Cod_equipo`, `D_equipo`, `Zona`).
+`expandir_herramientas()` replica la vista `v_civil_registros_herramientas`:
+usa el arreglo y, si está vacío, las columnas sueltas. Se hace en pandas y no
+consultando la vista para no tener que abrir otra política de lectura. El
+resultado es una tabla larga con `indice` apuntando al registro, que alimenta el
+filtro de herramienta, el gráfico de horas por herramienta y la hoja
+*Herramientas* del Excel.
 
-### Traducción de labores
+### `civil_vacaciones`
 
-`labor` es el **código** de la actividad (p. ej. `3080115139`), no su nombre.
-`agregar_actividades()` lo cruza contra `actividades` usando las columnas
-`codigo` → `nome`.
+`fecha_inicio`, `fecha_reintegro` (puede ser nula: vacaciones abiertas) y
+`dias`, calculado por la base. El rango es `[inicio, reintegro)`: el día de
+reintegro ya es laboral. `normalizar_vacaciones()` deriva `estado`
+(*Programadas*, *En curso*, *Finalizadas*) respecto a la fecha de hoy en
+Colombia.
 
-Degradación deliberada: si la maestra no se puede leer o el código no existe,
-la columna `actividad` conserva el código en lugar de quedar vacía, y la app
-avisa. Nunca se pierde la fila por un problema de la maestra.
+La vista **Vacaciones** muestra las que se cruzan con el rango de fechas, no
+sólo las que empiezan en él, y respeta el filtro de colaborador.
 
 ---
 
@@ -262,15 +262,17 @@ avisa. Nunca se pierde la fila por un problema de la maestra.
 
 | Regla | Condición |
 |---|---|
-| Horómetro sin avance | `Δ ≤ 0` y `horas > 0` |
-| Horómetro final menor al inicial | `horometro_final < horometro_inicio` |
-| Avance de horómetro mayor a las horas | `Δ > horas + 1` |
-| Horas no coinciden con el horario | `abs(horas − horas_calendario) > 0.5` |
-| Sin área registrada | `area_trabajada ≤ 0` |
+| Horas no coinciden con el horario | `abs(horas_totales − horas_calendario) > 0.05` |
+| Normales + adicionales no suman el total | `abs(horas_normales + horas_adicionales − horas_totales) > 0.05`, sólo si hay `horas_normales` |
+| Herramienta con más horas que la labor | suma de horas de herramientas `> horas_totales` |
+| Jornada incompleta | horas del colaborador en el día `< JORNADA_HORAS` |
+| Jornada larga sin horas adicionales | horas del día `> JORNADA_HORAS` y ninguna adicional |
+| Registro durante vacaciones | la fecha cae en `[fecha_inicio, fecha_reintegro)` de unas vacaciones del mismo colaborador |
 
-Las tolerancias (`+1` hora y `0.5` h) absorben redondeos de captura. La tercera
-regla es la que detecta el error habitual de anotar kilometraje en el campo del
-horómetro.
+`JORNADA_HORAS` vale 9 (06:00 a 15:00). Las reglas de jornada suman el día
+completo del colaborador y marcan todos los tramos de ese día. Se calculan sobre
+`datos`, antes de filtrar, así que filtrar por clasificación o actividad no hace
+aparecer jornadas incompletas que no lo son.
 
 Para agregar una regla: añada la fila en `marcar_alertas()` **y** la entrada
 correspondiente en `REGLAS`. La vista de calidad recorre `REGLAS`, así que una
@@ -334,7 +336,7 @@ que la preferencia del navegador no altere el contraste.
 ## Fechas
 
 El formato de presentación es **DD/MM/AA** y vive en una sola constante,
-`FORMATO_FECHA`. Aplica igual a `fecha` y a `registrado_en` (*Fecha digitación*).
+`FORMATO_FECHA`. Aplica igual a `fecha`, a las fechas de vacaciones y a `created_at` (*Fecha digitación*).
 
 Tres detalles que no son evidentes:
 
@@ -346,7 +348,7 @@ Tres detalles que no son evidentes:
 - **Las exportaciones sí van formateadas.** `para_exportar()` convierte las
   fechas a texto justo antes de generar el Excel o el CSV. Sin eso el CSV
   saldría en formato ISO.
-- **`registrado_en` se parsea con `format="ISO8601"`.** Postgres recorta los
+- **`created_at` se parsea con `format="ISO8601"`.** Postgres recorta los
   microsegundos en cero, así que la misma columna trae `...02.384+00` y
   `...00+00`. Con inferencia automática pandas toma el formato de la primera
   fila y convierte el resto a `NaT`, dejando celdas vacías al azar.
@@ -370,6 +372,8 @@ para que el siguiente ingreso vuelva a mostrarla.
 | Cambiar cómo se llama un campo en pantalla | `ETIQUETAS` |
 | Mostrar u ocultar columnas del detalle, o reordenarlas | `ORDEN_COLUMNAS` |
 | Agregar una validación | `marcar_alertas()` + `REGLAS` |
+| Cambiar la duración de la jornada | `JORNADA_HORAS` |
+| Traducir una clave nueva del bot | Los diccionarios `NOMBRES_*` |
 | Agregar un filtro global | `_opciones()` + `_seleccion()` arriba del selector de vista, y el bucle que aplica los filtros |
 | Agregar un filtro secundario | `multiselector()` en la barra lateral |
 | Cambiar el formato de las fechas | `FORMATO_FECHA` y `CONFIG_COLUMNAS` |
@@ -380,7 +384,7 @@ para que el siguiente ingreso vuelva a mostrarla.
 
 ## Limitaciones conocidas
 
-- **Zona horaria fija.** `registrado_en` se ajusta restando 5 horas. Es correcto
+- **Zona horaria fija.** `created_at` y el estado de las vacaciones se ajustan restando 5 horas. Es correcto
   para Colombia, que no aplica horario de verano, pero rompería en otra zona.
 - **Sólo lectura.** No hay forma de corregir un registro desde el tablero; las
   inconsistencias que muestra la vista de calidad se corrigen en el origen.
@@ -401,3 +405,4 @@ para que el siguiente ingreso vuelva a mostrarla.
 | [.streamlit/config.toml](.streamlit/config.toml) | Tema visual. |
 | [.env.example](.env.example) | Plantilla de variables locales. |
 | [.streamlit/secrets.toml.example](.streamlit/secrets.toml.example) | Plantilla de variables en la nube. |
+| `supabase_politicas_civil.sql` | Políticas RLS de lectura. Local, no se publica. |

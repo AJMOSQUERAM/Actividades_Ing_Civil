@@ -1,6 +1,7 @@
-"""Dashboard del Registro Diario de Labores de Maquinaria.
+"""Dashboard del Registro Diario de Actividades de Ingeniería Civil.
 
-Fuente de datos: la tabla de Supabase que alimenta el bot de Telegram (n8n).
+Fuente de datos: las tablas de Supabase que alimenta el bot de Telegram (n8n):
+`civil_registros` (labores, cuentas control y novedades) y `civil_vacaciones`.
 El acceso es con usuario y contraseña de Supabase Auth: cada consulta viaja con
 el token de quien inició sesión, así que las políticas RLS se aplican por usuario.
 
@@ -58,12 +59,12 @@ def _rol_declarado(clave: str) -> str:
 
 SUPABASE_URL = _config("SUPABASE_URL")
 SUPABASE_KEY = _config("SUPABASE_KEY")
-SUPABASE_TABLA = _config("SUPABASE_TABLE", "registro_labores_maquinaria")
-# Maestra de labores: el campo `labor` de cada registro es el código de la actividad.
-ACTIVIDADES_TABLA = _config("SUPABASE_ACTIVIDADES_TABLE", "actividades")
-# Maestra de equipos: asocia cada código de equipo con su descripción y su zona.
-# El nombre lleva mayúsculas y PostgREST es sensible a ellas.
-ZONAS_TABLA = _config("SUPABASE_ZONAS_TABLE", "Maestro_Equipos_Zonas")
+SUPABASE_TABLA = _config("SUPABASE_TABLE", "civil_registros")
+VACACIONES_TABLA = _config("SUPABASE_VACACIONES_TABLE", "civil_vacaciones")
+
+# Jornada ordinaria (06:00 a 15:00). Un día que no la complete, o que la supere
+# sin reportar horas adicionales, queda marcado en la vista de calidad.
+JORNADA_HORAS = 9.0
 
 # Paleta de marca, validada para fondo claro.
 #
@@ -89,84 +90,119 @@ REJILLA = "#eceae5"
 ETIQUETAS = {
     "fecha": "Fecha",
     "ficha": "Ficha",
-    "nombre_completo": "Operador",
-    "ip_equipo": "Equipo",
-    "nombre_equipo": "Descripción equipo",
-    "zona": "Zona",
-    "tiene_implemento": "Con implemento",
-    "cantidad_implementos": "N° implementos",
-    "implemento_1": "Implemento 1",
-    "implemento_2": "Implemento 2",
-    "area_trabajada": "Área (ha)",
-    "hora_inicio": "Hora inicio",
-    "horometro_inicio": "Horómetro inicio",
-    "hda": "Hacienda",
-    "ste": "Suerte",
-    "labor": "Código actividad",
+    "colaborador": "Colaborador",
+    "tipo_registro": "Tipo de registro",
+    "clasificacion": "Clasificación",
+    "codigo": "Código",
     "actividad": "Actividad",
-    "hora_final": "Hora final",
-    "horometro_final": "Horómetro final",
-    "horas_trabajadas": "Horas trabajadas",
-    "horometro_diferencia": "Δ Horómetro",
-    "tiene_observaciones": "Con observación",
-    "observaciones": "Observaciones",
-    "registrado_en": "Fecha digitación",
+    "labor_codigo": "Código labor",
+    "labor_desc": "Labor",
+    "cuenta_control": "Cuenta control",
+    "cuenta_desc": "Descripción cuenta",
+    "novedad_tipo": "Novedad",
+    "hacienda_codigo": "Código hacienda",
+    "hacienda_nombre": "Hacienda",
+    "zona_cosecha": "Zona cosecha",
+    "cuenta_gasto": "Cuenta gasto",
+    "hora_inicio": "Hora inicio",
+    "hora_fin": "Hora fin",
+    "horas_totales": "Horas",
+    "horas_normales": "Horas normales",
+    "horas_adicionales": "Horas adicionales",
+    "tipo_hora_adicional": "Tipo hora adicional",
+    "herramientas_texto": "Herramientas",
+    "herramientas_desc": "Descripción herramienta",
+    "horas_herramienta": "Horas herramienta",
+    "herramienta_ip": "Herramienta",
+    "herramienta_desc": "Descripción herramienta",
+    "herramienta_horas": "Horas de uso",
+    "created_at": "Fecha digitación",
+    "fecha_inicio": "Inicio",
+    "fecha_reintegro": "Reintegro",
+    "dias": "Días",
+    "estado": "Estado",
 }
 
 FORMATO_FECHA = "%d/%m/%y"  # DD/MM/AA, igual en fecha y fecha de digitación
 
-# Columnas que se piden a la base. Se excluyen las internas (id_registro,
-# fecha_original, telegram_chat_id, telegram_usuario): no se muestran nunca.
+# Columnas que se piden a la base. Se excluyen las internas (id, id_registro,
+# origen, chat_id) y las que el bot no llena (labor_grupo, clase_labor).
 COLUMNAS_CONSULTA = ",".join([
-    "ficha", "nombre_completo", "ip_equipo", "tiene_implemento",
-    "cantidad_implementos", "implemento_1", "implemento_2", "fecha",
-    "area_trabajada", "hora_inicio", "horometro_inicio", "hda", "ste", "labor",
-    "hora_final", "horometro_final", "horas_trabajadas", "horometro_diferencia",
-    "tiene_observaciones", "observaciones", "registrado_en",
+    "ficha", "colaborador", "fecha", "tipo_registro", "labor_codigo", "labor_desc",
+    "cuenta_control", "cuenta_desc", "ubicacion_tipo", "hacienda_codigo",
+    "hacienda_nombre", "zona_cosecha", "hora_inicio", "hora_fin", "horas_totales",
+    "uso_herramienta", "herramienta_ip", "herramienta_desc", "herramienta_horas",
+    "herramientas", "tipo_labor", "cuenta_gasto", "novedad_tipo", "horas_normales",
+    "horas_adicionales", "tipo_hora_adicional", "created_at",
 ])
+COLUMNAS_VACACIONES = "ficha,colaborador,fecha_inicio,fecha_reintegro,dias,created_at"
 
 COLUMNAS_NUMERICAS = [
-    "cantidad_implementos",
-    "area_trabajada",
-    "horometro_inicio",
-    "horometro_final",
-    "horas_trabajadas",
-    "horometro_diferencia",
+    "horas_totales",
+    "horas_normales",
+    "horas_adicionales",
+    "herramienta_horas",
 ]
-COLUMNAS_BOOLEANAS = ["tiene_implemento", "tiene_observaciones"]
+COLUMNAS_BOOLEANAS = ["uso_herramienta"]
 COLUMNAS_TEXTO = [
     "ficha",
-    "nombre_completo",
-    "ip_equipo",
-    "hda",
-    "ste",
-    "labor",
-    "implemento_1",
-    "implemento_2",
+    "colaborador",
+    "tipo_registro",
+    "labor_codigo",
+    "labor_desc",
+    "cuenta_control",
+    "cuenta_desc",
+    "ubicacion_tipo",
+    "hacienda_codigo",
+    "hacienda_nombre",
+    "zona_cosecha",
+    "hora_inicio",
+    "hora_fin",
+    "herramienta_ip",
+    "herramienta_desc",
+    "tipo_labor",
+    "cuenta_gasto",
+    "novedad_tipo",
+    "tipo_hora_adicional",
 ]
+
+# Los valores que guarda el bot son claves internas; en pantalla se traducen.
+NOMBRES_TIPO_REGISTRO = {
+    "labor": "Labor",
+    "cuenta_control": "Cuenta control",
+    "novedad": "Novedad",
+}
+NOMBRES_TIPO_LABOR = {
+    "administrativa": "Administrativa",
+    "campo": "Campo",
+    "cosecha": "Cosecha",
+}
+NOMBRES_NOVEDAD = {
+    "permiso_calamidad": "Permiso por calamidad",
+    "permiso_cita_medica": "Permiso por cita médica",
+}
+NOMBRES_HORA_ADICIONAL = {"extra": "Extra", "banco": "Banco de horas"}
 
 # Orden de columnas en las tablas de detalle.
 ORDEN_COLUMNAS = [
     "fecha",
-    "zona",
-    "labor",
+    "clasificacion",
+    "codigo",
     "actividad",
-    "hda",
-    "ste",
+    "hacienda_nombre",
+    "zona_cosecha",
+    "cuenta_gasto",
     "ficha",
-    "nombre_completo",
-    "ip_equipo",
-    "nombre_equipo",
-    "implemento_1",
-    "implemento_2",
+    "colaborador",
     "hora_inicio",
-    "hora_final",
-    "horas_trabajadas",
-    "area_trabajada",
-    "horometro_inicio",
-    "horometro_final",
-    "horometro_diferencia",
-    "observaciones",
+    "hora_fin",
+    "horas_totales",
+    "horas_normales",
+    "horas_adicionales",
+    "tipo_hora_adicional",
+    "herramientas_texto",
+    "herramientas_desc",
+    "horas_herramienta",
 ]
 
 
@@ -178,14 +214,19 @@ def _a_booleano(serie: pd.Series) -> pd.Series:
 
 
 def _a_fecha(serie: pd.Series) -> pd.Series:
-    texto = serie.astype(str).str.strip()
-    fechas = pd.to_datetime(texto, format="%d/%m/%Y", errors="coerce")
-    pendientes = fechas.isna() & ~texto.isin(["", "nan", "None", "NaT"])
-    if pendientes.any():
-        fechas.loc[pendientes] = pd.to_datetime(
-            texto[pendientes], errors="coerce", dayfirst=True, format="mixed"
-        )
-    return fechas
+    """Las columnas `date` de Postgres llegan como AAAA-MM-DD."""
+    return pd.to_datetime(serie, errors="coerce", format="ISO8601")
+
+
+def _a_digitacion(serie: pd.Series) -> pd.Series:
+    # El bot guarda en UTC; se muestra en hora de Colombia (UTC-5).
+    # format="ISO8601" es necesario: Postgres recorta los microsegundos en
+    # cero, así que la misma columna trae "...02.384+00" y "...00+00". Con
+    # inferencia automática pandas toma el formato de la primera fila y
+    # convierte el resto a NaT, dejando la fecha de digitación en blanco.
+    return pd.to_datetime(
+        serie, errors="coerce", utc=True, format="ISO8601"
+    ).dt.tz_localize(None) - pd.Timedelta(hours=5)
 
 
 def _a_horas(serie: pd.Series) -> pd.Series:
@@ -194,6 +235,47 @@ def _a_horas(serie: pd.Series) -> pd.Series:
     horas = pd.to_numeric(partes[0], errors="coerce")
     minutos = pd.to_numeric(partes[1], errors="coerce")
     return horas + minutos / 60
+
+
+def _lista_herramientas(valor) -> list[dict]:
+    """El jsonb llega como lista desde PostgREST, o como texto si viene de otra fuente."""
+    if isinstance(valor, str):
+        try:
+            valor = json.loads(valor)
+        except ValueError:
+            return []
+    return [e for e in valor if isinstance(e, dict)] if isinstance(valor, list) else []
+
+
+def expandir_herramientas(df: pd.DataFrame) -> pd.DataFrame:
+    """Una fila por herramienta usada, con el índice del registro en `indice`.
+
+    Replica la vista `v_civil_registros_herramientas`: toma el arreglo
+    `herramientas` y, si está vacío, las columnas sueltas de los registros
+    anteriores a ese arreglo. Se hace aquí y no con la vista para no tener que
+    abrir otra política de lectura.
+    """
+    filas: list[dict] = []
+    columnas = ["herramientas", "herramienta_ip", "herramienta_desc", "herramienta_horas"]
+    valores = [df[c] if c in df.columns else pd.Series(None, index=df.index) for c in columnas]
+    for indice, lista, ip, desc, horas in zip(df.index, *valores):
+        elementos = _lista_herramientas(lista)
+        if not elementos and ip:
+            elementos = [{"ip": ip, "desc": desc, "horas": horas}]
+        for elemento in elementos:
+            filas.append({
+                "indice": indice,
+                "herramienta_ip": str(elemento.get("ip") or "").strip(),
+                "herramienta_desc": str(elemento.get("desc") or "").strip(),
+                "herramienta_horas": pd.to_numeric(elemento.get("horas"), errors="coerce"),
+            })
+    usadas = pd.DataFrame(
+        filas, columns=["indice", "herramienta_ip", "herramienta_desc", "herramienta_horas"]
+    )
+    usadas["herramienta"] = (
+        usadas["herramienta_ip"] + " · " + usadas["herramienta_desc"]
+    ).str.strip(" ·")
+    return usadas
 
 
 def normalizar(df: pd.DataFrame) -> pd.DataFrame:
@@ -209,46 +291,90 @@ def normalizar(df: pd.DataFrame) -> pd.DataFrame:
     for columna in COLUMNAS_BOOLEANAS:
         if columna in df.columns:
             df[columna] = _a_booleano(df[columna])
-    for columna in COLUMNAS_TEXTO + ["observaciones"]:
-        if columna in df.columns:
-            df[columna] = (
-                df[columna].astype(str).str.strip().replace({"nan": "", "None": "", "<NA>": ""})
-            )
+    for columna in COLUMNAS_TEXTO:
+        if columna not in df.columns:
+            df[columna] = ""
+        df[columna] = (
+            df[columna].astype(str).str.strip().replace({"nan": "", "None": "", "<NA>": ""})
+        )
 
-    if "fecha" in df.columns:
-        df["fecha"] = _a_fecha(df["fecha"])
-    else:
-        df["fecha"] = pd.NaT
+    df["fecha"] = _a_fecha(df["fecha"]) if "fecha" in df.columns else pd.NaT
+    if "created_at" in df.columns:
+        df["created_at"] = _a_digitacion(df["created_at"])
+    df["horas_adicionales"] = df.get("horas_adicionales", pd.Series(0.0, index=df.index)).fillna(0)
 
-    if "registrado_en" in df.columns:
-        # El bot guarda en UTC; se muestra en hora de Colombia (UTC-5).
-        # format="ISO8601" es necesario: Postgres recorta los microsegundos en
-        # cero, así que la misma columna trae "...02.384+00" y "...00+00". Con
-        # inferencia automática pandas toma el formato de la primera fila y
-        # convierte el resto a NaT, dejando la fecha de digitación en blanco.
-        df["registrado_en"] = pd.to_datetime(
-            df["registrado_en"], errors="coerce", utc=True, format="ISO8601"
-        ).dt.tz_localize(None) - pd.Timedelta(hours=5)
+    # Postgres entrega `time` como 06:00:00; los segundos no aportan.
+    df["hora_inicio"] = df["hora_inicio"].str[:5]
+    df["hora_fin"] = df["hora_fin"].str[:5]
+    df["horas_calendario"] = _a_horas(df["hora_fin"]) - _a_horas(df["hora_inicio"])
 
-    inicio = _a_horas(df["hora_inicio"]) if "hora_inicio" in df.columns else pd.Series(index=df.index, dtype=float)
-    final = _a_horas(df["hora_final"]) if "hora_final" in df.columns else pd.Series(index=df.index, dtype=float)
-    jornada = final - inicio
-    df["horas_calendario"] = jornada.where(jornada >= 0, jornada + 24)
+    # Actividad y código comunes a los tres tipos de registro, para filtrar y
+    # graficar sin distinguir de dónde salió cada uno.
+    tipo = df["tipo_registro"]
+    novedad = df["novedad_tipo"].map(NOMBRES_NOVEDAD).fillna(df["novedad_tipo"])
+    cuenta = df["cuenta_desc"].where(df["cuenta_desc"] != "", "Cuenta " + df["cuenta_control"])
+    df["actividad"] = df["labor_desc"].where(tipo == "labor", cuenta.where(tipo == "cuenta_control", novedad))
+    df["codigo"] = df["labor_codigo"].where(tipo == "labor", df["cuenta_control"])
+
+    # Clasificación: el tipo de labor para las labores y el tipo de registro
+    # para lo demás. Es el corte que interesa al digitar.
+    df["clasificacion"] = df["tipo_labor"].map(NOMBRES_TIPO_LABOR).where(
+        tipo == "labor", tipo.map(NOMBRES_TIPO_REGISTRO)
+    ).fillna("Labor")
+    df["tipo_registro"] = tipo.map(NOMBRES_TIPO_REGISTRO).fillna(tipo)
+    df["tipo_hora_adicional"] = (
+        df["tipo_hora_adicional"].map(NOMBRES_HORA_ADICIONAL).fillna(df["tipo_hora_adicional"])
+    )
 
     df["clave"] = (
-        df.get("ficha", pd.Series("", index=df.index)).astype(str)
+        df["ficha"]
         + "|"
         + df["fecha"].dt.strftime("%Y-%m-%d").fillna("")
         + "|"
-        + df.get("hora_inicio", pd.Series("", index=df.index)).astype(str)
-        + "|"
-        + df.get("labor", pd.Series("", index=df.index)).astype(str)
+        + df["hora_inicio"]
     )
 
-    orden = [c for c in ["fecha", "nombre_completo", "hora_inicio"] if c in df.columns]
-    if orden:
-        df = df.sort_values(orden, na_position="last")
+    df = df.sort_values(["fecha", "colaborador", "hora_inicio"], na_position="last")
     return df.reset_index(drop=True)
+
+
+def agregar_herramientas(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Resume en cada registro las herramientas que usó."""
+    usadas = expandir_herramientas(df)
+    por_registro = usadas.groupby("indice").agg(
+        herramientas_texto=(
+            "herramienta_ip",
+            lambda ips: " · ".join(ips),
+        ),
+        # Mismo orden que las IPs, para que cada descripción corresponda a la suya.
+        herramientas_desc=(
+            "herramienta_desc",
+            lambda descripciones: " · ".join(descripciones),
+        ),
+        horas_herramienta=("herramienta_horas", "sum"),
+    )
+    df = df.join(por_registro)
+    df["herramientas_texto"] = df["herramientas_texto"].fillna("")
+    df["herramientas_desc"] = df["herramientas_desc"].fillna("")
+    return df, usadas
+
+
+def normalizar_vacaciones(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    for columna in ("ficha", "colaborador"):
+        df[columna] = df[columna].astype(str).str.strip()
+    df["fecha_inicio"] = _a_fecha(df["fecha_inicio"])
+    df["fecha_reintegro"] = _a_fecha(df["fecha_reintegro"])
+    df["dias"] = pd.to_numeric(df["dias"], errors="coerce")
+    if "created_at" in df.columns:
+        df["created_at"] = _a_digitacion(df["created_at"])
+
+    hoy = (pd.Timestamp.now(tz="UTC").tz_localize(None) - pd.Timedelta(hours=5)).normalize()
+    # El reintegro es el día en que vuelve: las vacaciones terminan el día anterior.
+    df["estado"] = "En curso"
+    df.loc[df["fecha_inicio"] > hoy, "estado"] = "Programadas"
+    df.loc[df["fecha_reintegro"] <= hoy, "estado"] = "Finalizadas"
+    return df.sort_values("fecha_inicio", ascending=False).reset_index(drop=True)
 
 
 @st.cache_resource(show_spinner=False)
@@ -306,123 +432,21 @@ def cargar_registros(tabla: str, usuario_id: str, _token: str) -> pd.DataFrame:
     return _descargar(tabla, usuario_id, _token, COLUMNAS_CONSULTA)
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def cargar_actividades(
-    tabla: str, codigos: tuple[str, ...], usuario_id: str, _token: str
-) -> pd.DataFrame:
-    """Sólo los nombres de los códigos presentes en los registros.
+@st.cache_data(ttl=300, show_spinner=False)
+def cargar_vacaciones(tabla: str, usuario_id: str, _token: str) -> pd.DataFrame:
+    return _descargar(tabla, usuario_id, _token, COLUMNAS_VACACIONES)
 
-    La maestra tiene ~1600 filas (dos páginas, ~800 ms). Pidiendo los códigos
-    que de verdad aparecen, una página basta (~190 ms).
+
+def obtener_datos(usuario_id: str, token: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Lee los registros como el usuario autenticado y los deja listos para graficar.
+
+    Devuelve los registros y la tabla larga de herramientas usadas.
     """
-    if not codigos:
-        return pd.DataFrame(columns=["codigo", "nome"])
-
-    cliente = _cliente(usuario_id, _token)
-    respuesta = (
-        cliente.table(tabla).select("codigo,nome").in_("codigo", list(codigos)).execute()
-    )
-    maestro = pd.DataFrame(respuesta.data or [])
-    if maestro.empty:
-        return maestro
-    maestro["codigo"] = maestro["codigo"].astype(str).str.strip()
-    maestro["nome"] = maestro["nome"].astype(str).str.strip()
-    return maestro.drop_duplicates(subset="codigo")
-
-
-SIN_ZONA = "Sin zona"
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def cargar_zonas(tabla: str, usuario_id: str, _token: str) -> pd.DataFrame:
-    """Maestra de equipos: código, descripción y zona."""
-    maestro = _descargar(tabla, usuario_id, _token, "Cod_equipo,D_equipo,Zona")
-    if maestro.empty:
-        return maestro
-    maestro = maestro.rename(
-        columns={"Cod_equipo": "codigo_equipo", "D_equipo": "nombre_equipo", "Zona": "zona"}
-    )
-    for columna in ("codigo_equipo", "nombre_equipo", "zona"):
-        if columna in maestro.columns:
-            # Las tres columnas de la maestra son nullable: un NULL llegaría como
-            # el texto "None" y se mostraría tal cual en el filtro.
-            maestro[columna] = (
-                maestro[columna]
-                .astype(str)
-                .str.strip()
-                .replace({"nan": "", "None": "", "<NA>": "", "null": ""})
-            )
-    # La llave de cruce se normaliza a mayúsculas: los códigos vienen de dos
-    # capturas distintas y no siempre coinciden en caja.
-    maestro["llave"] = maestro["codigo_equipo"].str.upper()
-    return maestro.drop_duplicates(subset="llave")
-
-
-def agregar_zonas(df: pd.DataFrame, usuario_id: str, token: str) -> pd.DataFrame:
-    """Cruza el equipo del registro contra la maestra para traer zona y descripción."""
-    df = df.copy()
-    df["zona"] = SIN_ZONA
-    df["nombre_equipo"] = df.get("ip_equipo", "")
-
-    if "ip_equipo" not in df.columns:
-        return df
-    try:
-        maestro = cargar_zonas(ZONAS_TABLA, usuario_id, token)
-    except Exception as error:
-        st.warning(f"No se pudo leer la maestra de equipos y zonas: {error}")
-        return df
-    if maestro.empty:
-        st.warning(
-            f"No se pudo leer «{ZONAS_TABLA}»: los registros quedan sin zona. "
-            "Revise la política de lectura de esa tabla."
-        )
-        return df
-
-    llaves = df["ip_equipo"].astype(str).str.strip().str.upper()
-    zonas = dict(zip(maestro["llave"], maestro["zona"]))
-    nombres = dict(zip(maestro["llave"], maestro["nombre_equipo"]))
-    # Un equipo que no esté en la maestra conserva su registro y queda en
-    # "Sin zona": nunca se pierde una fila por un faltante del maestro.
-    df["zona"] = llaves.map(zonas).replace("", pd.NA).fillna(SIN_ZONA)
-    df["nombre_equipo"] = llaves.map(nombres).replace("", pd.NA).fillna(df["ip_equipo"])
-    return df
-
-
-def agregar_actividades(df: pd.DataFrame, usuario_id: str, token: str) -> pd.DataFrame:
-    """Traduce el código de `labor` al nombre de la actividad usando la tabla maestra."""
-    df = df.copy()
-    if "labor" not in df.columns:
-        df["actividad"] = ""
-        return df
-
-    codigos = df["labor"].astype(str).str.strip()
-    df["actividad"] = codigos  # si no hay maestra, al menos se ve el código
-
-    presentes = tuple(sorted(c for c in codigos.unique() if c))
-    try:
-        maestro = cargar_actividades(ACTIVIDADES_TABLA, presentes, usuario_id, token)
-    except Exception as error:  # la app sigue funcionando con el código a la vista
-        st.warning(f"No se pudo leer la tabla de actividades: {error}")
-        return df
-    if maestro.empty:
-        st.warning(
-            f"No se pudo leer la maestra «{ACTIVIDADES_TABLA}»: se muestran los códigos "
-            "de actividad en lugar de los nombres. Revise la política de lectura de esa tabla."
-        )
-        return df
-
-    nombres = codigos.map(dict(zip(maestro["codigo"], maestro["nome"])))
-    df["actividad"] = nombres.fillna(codigos).replace("", pd.NA).fillna(codigos)
-    return df
-
-
-def obtener_datos(usuario_id: str, token: str) -> pd.DataFrame:
-    """Lee los registros como el usuario autenticado y los deja listos para graficar."""
     try:
         datos = cargar_registros(SUPABASE_TABLA, usuario_id, token)
     except Exception as error:
         st.error(f"No se pudo consultar la base de datos: {error}")
-        return pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame()
 
     if datos.empty:
         st.warning(
@@ -430,10 +454,21 @@ def obtener_datos(usuario_id: str, token: str) -> pd.DataFrame:
             "datos, revise que exista la política de lectura (SELECT) para el rol "
             "`authenticated`."
         )
-        return pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame()
 
-    datos = agregar_actividades(normalizar(datos), usuario_id, token)
-    return agregar_zonas(datos, usuario_id, token)
+    return agregar_herramientas(normalizar(datos))
+
+
+def obtener_vacaciones(usuario_id: str, token: str) -> pd.DataFrame:
+    """Vacaciones registradas. Si no se pueden leer, la app sigue sin ellas."""
+    try:
+        vacaciones = cargar_vacaciones(VACACIONES_TABLA, usuario_id, token)
+    except Exception as error:
+        st.warning(f"No se pudo leer la tabla de vacaciones: {error}")
+        return pd.DataFrame()
+    if vacaciones.empty:
+        return vacaciones
+    return normalizar_vacaciones(vacaciones)
 
 
 # --------------------------------------------------------------------------- #
@@ -521,26 +556,62 @@ def pantalla_ingreso() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Validaciones previas a la digitación en BIOSA
+# Validaciones previas a la digitación
 # --------------------------------------------------------------------------- #
+# Lo que la base ya impide (cruces de horario, herramienta sin IP, labor sin
+# ubicación) no se repite aquí: estas reglas cubren lo que la base deja pasar.
 REGLAS = {
-    "Horómetro sin avance": "El horómetro no cambió aunque se reportaron horas trabajadas.",
-    "Horómetro final menor al inicial": "El horómetro final quedó por debajo del inicial.",
-    "Avance de horómetro mayor a las horas": "El horómetro avanzó más de lo que dura la jornada reportada.",
-    "Horas no coinciden con el horario": "Las horas trabajadas no cuadran con hora inicio / hora final.",
-    "Sin área registrada": "El registro quedó sin área trabajada.",
+    "Horas no coinciden con el horario": "Las horas del registro no cuadran con hora inicio / hora fin.",
+    "Normales + adicionales no suman el total": "Las horas normales más las adicionales no dan las horas del registro.",
+    "Herramienta con más horas que la labor": "Las horas de uso de las herramientas superan las horas del registro.",
+    "Jornada incompleta": f"El colaborador registró menos de {JORNADA_HORAS:g} horas en el día.",
+    "Jornada larga sin horas adicionales": (
+        f"El colaborador registró más de {JORNADA_HORAS:g} horas en el día y ninguna como adicional."
+    ),
+    "Registro durante vacaciones": "Hay registros en una fecha en que el colaborador figura de vacaciones.",
 }
 
 
-def marcar_alertas(df: pd.DataFrame) -> pd.DataFrame:
-    horas = df["horas_trabajadas"].fillna(0)
-    delta = df["horometro_diferencia"].fillna(0)
+def _en_vacaciones(df: pd.DataFrame, vacaciones: pd.DataFrame) -> pd.Series:
+    """Registros cuya fecha cae dentro de unas vacaciones del mismo colaborador.
+
+    Igual que la restricción de la base, el rango es [inicio, reintegro): el día
+    de reintegro ya es laboral, y sin reintegro las vacaciones siguen abiertas.
+    """
+    resultado = pd.Series(False, index=df.index)
+    if vacaciones.empty:
+        return resultado
+    cruce = (
+        df[["ficha", "fecha"]]
+        .reset_index()
+        .merge(vacaciones[["ficha", "fecha_inicio", "fecha_reintegro"]], on="ficha")
+    )
+    dentro = (cruce["fecha"] >= cruce["fecha_inicio"]) & (
+        cruce["fecha_reintegro"].isna() | (cruce["fecha"] < cruce["fecha_reintegro"])
+    )
+    resultado.loc[cruce.loc[dentro, "index"].unique()] = True
+    return resultado
+
+
+def marcar_alertas(df: pd.DataFrame, vacaciones: pd.DataFrame) -> pd.DataFrame:
+    horas = df["horas_totales"].fillna(0)
+    adicionales = df["horas_adicionales"].fillna(0)
+    dia = df.groupby(["ficha", "fecha"])
+    horas_dia = dia["horas_totales"].transform("sum")
+    adicionales_dia = dia["horas_adicionales"].transform("sum")
+
     alertas = pd.DataFrame(index=df.index)
-    alertas["Horómetro sin avance"] = (delta <= 0) & (horas > 0)
-    alertas["Horómetro final menor al inicial"] = df["horometro_final"] < df["horometro_inicio"]
-    alertas["Avance de horómetro mayor a las horas"] = delta > (horas + 1)
-    alertas["Horas no coinciden con el horario"] = (horas - df["horas_calendario"]).abs() > 0.5
-    alertas["Sin área registrada"] = df["area_trabajada"].fillna(0) <= 0
+    alertas["Horas no coinciden con el horario"] = (horas - df["horas_calendario"]).abs() > 0.05
+    # horas_normales sólo existe en los registros recientes; sin dato no se evalúa.
+    alertas["Normales + adicionales no suman el total"] = df["horas_normales"].notna() & (
+        (df["horas_normales"] + adicionales - horas).abs() > 0.05
+    )
+    alertas["Herramienta con más horas que la labor"] = df["horas_herramienta"].fillna(0) > horas + 0.01
+    alertas["Jornada incompleta"] = horas_dia < JORNADA_HORAS - 0.01
+    alertas["Jornada larga sin horas adicionales"] = (horas_dia > JORNADA_HORAS + 0.01) & (
+        adicionales_dia <= 0
+    )
+    alertas["Registro durante vacaciones"] = _en_vacaciones(df, vacaciones)
     return alertas.fillna(False).astype(bool)
 
 
@@ -595,8 +666,8 @@ def barras_horizontales(datos: pd.DataFrame, categoria: str, valor: str, titulo:
     return _afinar(barras + etiquetas, titulo, alto)
 
 
-def barras_por_dia(datos: pd.DataFrame, titulo: str):
-    datos = datos.rename(columns={"horas_trabajadas": "valor"})
+def barras_por_dia(datos: pd.DataFrame, valor: str, titulo: str):
+    datos = datos.rename(columns={valor: "valor"})
     base = alt.Chart(datos).encode(
         x=alt.X("fecha:T", title=None, axis=alt.Axis(format="%d/%m", grid=False)),
         y=alt.Y("valor:Q", title=None, axis=alt.Axis(grid=True, tickCount=4)),
@@ -642,20 +713,19 @@ def para_mostrar(df: pd.DataFrame, columnas: list[str] | None = None) -> pd.Data
 def para_exportar(tabla: pd.DataFrame) -> pd.DataFrame:
     """Copia con las fechas ya formateadas, para Excel y CSV."""
     tabla = tabla.copy()
-    for columna in (ETIQUETAS["fecha"], ETIQUETAS["registrado_en"]):
-        if columna in tabla.columns:
-            tabla[columna] = tabla[columna].dt.strftime(FORMATO_FECHA)
+    for columna in tabla.select_dtypes(include="datetime").columns:
+        tabla[columna] = tabla[columna].dt.strftime(FORMATO_FECHA)
     return tabla
 
 
 # Formato de las columnas de fecha en las tablas. Streamlit muestra DD/MM/AA y
 # ordena por el valor real al hacer clic en el encabezado.
 CONFIG_COLUMNAS = {
-    ETIQUETAS["fecha"]: st.column_config.DateColumn(
-        ETIQUETAS["fecha"], format="DD/MM/YY"
-    ),
-    ETIQUETAS["registrado_en"]: st.column_config.DatetimeColumn(
-        ETIQUETAS["registrado_en"], format="DD/MM/YY"
+    ETIQUETAS[columna]: st.column_config.DateColumn(ETIQUETAS[columna], format="DD/MM/YY")
+    for columna in ("fecha", "fecha_inicio", "fecha_reintegro")
+} | {
+    ETIQUETAS["created_at"]: st.column_config.DatetimeColumn(
+        ETIQUETAS["created_at"], format="DD/MM/YY HH:mm"
     ),
 }
 
@@ -663,7 +733,7 @@ CONFIG_COLUMNAS = {
 # --------------------------------------------------------------------------- #
 # Interfaz
 # --------------------------------------------------------------------------- #
-st.set_page_config(page_title="Labores de maquinaria", page_icon="🚜", layout="wide")
+st.set_page_config(page_title="Actividades Ing. Civil", page_icon="🏗️", layout="wide")
 
 # Hoja de estilos. Los selectores por data-testid son los puntos de enganche de
 # Streamlit; si alguno cambia de nombre en una versión futura, la regla
@@ -817,8 +887,8 @@ def encabezado_marca(subtitulo: str) -> None:
     st.markdown(
         f"""
         <div class="marca">
-          <div class="marca-punto">🚜</div>
-          <div class="marca-texto">Labores de maquinaria</div>
+          <div class="marca-punto">🏗️</div>
+          <div class="marca-texto">Actividades de ingeniería civil</div>
         </div>
         <div class="marca-sub">{subtitulo}</div>
         """,
@@ -866,16 +936,18 @@ with st.sidebar:
 marcador_carga = st.empty()
 if not st.session_state.get("datos_listos"):
     marcador_carga.markdown(TARJETA_CARGANDO, unsafe_allow_html=True)
-datos = obtener_datos(st.session_state["sesion"]["id"], token)
+usuario_id = st.session_state["sesion"]["id"]
+datos, herramientas = obtener_datos(usuario_id, token)
+vacaciones = obtener_vacaciones(usuario_id, token) if not datos.empty else pd.DataFrame()
 marcador_carga.empty()
 if not datos.empty:
     st.session_state["datos_listos"] = True
 
 if datos.empty:
-    st.title("Registro diario de labores de maquinaria")
+    st.title("Registro diario de actividades de ingeniería civil")
     st.stop()
 
-alertas = marcar_alertas(datos)
+alertas = marcar_alertas(datos, vacaciones)
 datos["tiene_alerta"] = alertas.any(axis=1)
 datos["detalle_alertas"] = alertas.apply(lambda fila: " · ".join(alertas.columns[fila]), axis=1)
 
@@ -895,18 +967,17 @@ with st.sidebar:
             format="DD/MM/YYYY",
         )
 
-    def multiselector(columna: str, etiqueta: str) -> list[str]:
-        if columna not in datos.columns:
+    def multiselector(columna: str, etiqueta: str, origen: pd.DataFrame = datos) -> list[str]:
+        if columna not in origen.columns:
             return []
-        opciones = sorted(v for v in datos[columna].dropna().unique() if str(v).strip())
+        opciones = sorted(v for v in origen[columna].dropna().unique() if str(v).strip())
         return st.multiselect(etiqueta, opciones, placeholder="Todos")
 
-    operadores = multiselector("nombre_completo", "Operador")
-    suertes = multiselector("ste", "Suerte")
+    colaboradores = multiselector("colaborador", "Colaborador")
     actividades = multiselector("actividad", "Actividad")
-    equipos = multiselector("ip_equipo", "Equipo")
+    herramientas_elegidas = multiselector("herramienta", "Herramienta", herramientas)
     solo_alertas = st.checkbox("Sólo registros con alerta")
-    solo_observaciones = st.checkbox("Sólo registros con observación")
+    solo_herramienta = st.checkbox("Sólo registros con herramienta")
 
 # Opciones tomadas del conjunto completo, para que no cambien al filtrar.
 def _opciones(columna: str) -> list[str]:
@@ -915,44 +986,50 @@ def _opciones(columna: str) -> list[str]:
     return sorted(v for v in datos[columna].dropna().unique() if str(v).strip())
 
 
-ZONAS_DISPONIBLES = _opciones("zona")
-HACIENDAS_DISPONIBLES = _opciones("hda")
+CLASIFICACIONES_DISPONIBLES = _opciones("clasificacion")
+HACIENDAS_DISPONIBLES = _opciones("hacienda_nombre")
 
 
-# Los selectores se dibujan en la pestaña Detalle; Streamlit deja su valor en
-# session_state antes de ejecutar el script, así que aquí ya están disponibles.
+# Los selectores se dibujan más abajo, sobre el selector de vista; Streamlit deja
+# su valor en session_state antes de ejecutar el script, así que aquí ya están.
 def _seleccion(clave: str, validas: list[str]) -> list[str]:
     return [v for v in (st.session_state.get(clave) or []) if v in validas]
 
 
-zonas = _seleccion("filtro_zona", ZONAS_DISPONIBLES)
+clasificaciones = _seleccion("filtro_clasificacion", CLASIFICACIONES_DISPONIBLES)
 haciendas = _seleccion("filtro_hacienda", HACIENDAS_DISPONIBLES)
 
 filtrados = datos.copy()
 if rango and isinstance(rango, (list, tuple)) and len(rango) == 2:
     desde, hasta = pd.Timestamp(rango[0]), pd.Timestamp(rango[1])
     filtrados = filtrados[filtrados["fecha"].between(desde, hasta) | filtrados["fecha"].isna()]
+else:
+    desde = hasta = None
 for columna, seleccion in [
-    ("zona", zonas),
-    ("nombre_completo", operadores),
-    ("hda", haciendas),
-    ("ste", suertes),
+    ("clasificacion", clasificaciones),
+    ("colaborador", colaboradores),
+    ("hacienda_nombre", haciendas),
     ("actividad", actividades),
-    ("ip_equipo", equipos),
 ]:
     if seleccion:
         filtrados = filtrados[filtrados[columna].isin(seleccion)]
+if herramientas_elegidas:
+    con_elegidas = herramientas.loc[herramientas["herramienta"].isin(herramientas_elegidas), "indice"]
+    filtrados = filtrados[filtrados.index.isin(con_elegidas)]
 if solo_alertas:
     filtrados = filtrados[filtrados["tiene_alerta"]]
-if solo_observaciones and "tiene_observaciones" in filtrados.columns:
-    filtrados = filtrados[filtrados["tiene_observaciones"]]
+if solo_herramienta:
+    filtrados = filtrados[filtrados["herramientas_texto"] != ""]
 
-st.title("Registro diario de labores de maquinaria")
+# Herramientas de los registros que quedaron tras los filtros.
+herramientas_filtradas = herramientas[herramientas["indice"].isin(filtrados.index)]
+
+st.title("Registro diario de actividades de ingeniería civil")
 st.caption(
     f"{len(filtrados)} de {len(datos)} registros · último registro recibido: "
     + (
-        datos["registrado_en"].max().strftime(FORMATO_FECHA + " %H:%M")
-        if "registrado_en" in datos.columns and datos["registrado_en"].notna().any()
+        datos["created_at"].max().strftime(FORMATO_FECHA + " %H:%M")
+        if "created_at" in datos.columns and datos["created_at"].notna().any()
         else "sin dato"
     )
 )
@@ -963,107 +1040,123 @@ if filtrados.empty:
 
 columnas_kpi = st.columns(6)
 columnas_kpi[0].metric("Registros", f"{len(filtrados):,}".replace(",", "."))
-columnas_kpi[1].metric("Horas trabajadas", f"{filtrados['horas_trabajadas'].sum():,.1f}")
-columnas_kpi[2].metric("Área trabajada (ha)", f"{filtrados['area_trabajada'].sum():,.2f}")
-columnas_kpi[3].metric("Operadores", filtrados["nombre_completo"].nunique())
-columnas_kpi[4].metric("Zonas", filtrados["zona"].nunique())
+columnas_kpi[1].metric("Horas", f"{filtrados['horas_totales'].sum():,.1f}")
+columnas_kpi[2].metric("Horas adicionales", f"{filtrados['horas_adicionales'].sum():,.1f}")
+columnas_kpi[3].metric("Colaboradores", filtrados["ficha"].nunique())
+columnas_kpi[4].metric("Horas herramienta", f"{herramientas_filtradas['herramienta_horas'].sum():,.1f}")
 columnas_kpi[5].metric("Con alerta", int(filtrados["tiene_alerta"].sum()))
 
-col_zona, col_hacienda = st.columns(2)
-col_zona.multiselect(
-    "Zona",
-    ZONAS_DISPONIBLES,
-    key="filtro_zona",
-    placeholder="Todas las zonas",
-    help="Filtra los equipos por zona. Aplica a las tres vistas.",
+col_clasificacion, col_hacienda = st.columns(2)
+col_clasificacion.multiselect(
+    "Clasificación",
+    CLASIFICACIONES_DISPONIBLES,
+    key="filtro_clasificacion",
+    placeholder="Todas las clasificaciones",
+    help="Tipo de labor (administrativa, campo, cosecha), cuenta control o novedad. "
+    "Aplica a todas las vistas.",
 )
 col_hacienda.multiselect(
     "Hacienda",
     HACIENDAS_DISPONIBLES,
     key="filtro_hacienda",
     placeholder="Todas las haciendas",
-    help="Aplica a las tres vistas.",
+    help="Aplica a todas las vistas.",
 )
 
-# Un selector en lugar de pestañas: con st.tabs, Streamlit construye y envía las
-# tres vistas en cada interacción. Dibujando sólo la activa, cada cambio de
-# filtro manda un tercio de lo que mandaba.
-VISTAS = ["Detalle", "Resumen", "Calidad de datos"]
+# Un selector en lugar de pestañas: con st.tabs, Streamlit construye y envía
+# todas las vistas en cada interacción. Dibujando sólo la activa, cada cambio de
+# filtro manda una fracción de lo que mandaba.
+VISTAS = ["Detalle", "Resumen", "Vacaciones", "Calidad de datos"]
 vista_activa = st.segmented_control(
     "Vista", VISTAS, default="Detalle", key="vista", label_visibility="collapsed"
 ) or "Detalle"
 
 if vista_activa == "Resumen":
-    por_zona = filtrados.groupby("zona", as_index=False)["horas_trabajadas"].sum()
+    por_clasificacion = filtrados.groupby("clasificacion", as_index=False)["horas_totales"].sum()
     st.altair_chart(
-        barras_horizontales(por_zona, "zona", "horas_trabajadas",
-                            "Horas trabajadas por zona", "horas"),
+        barras_horizontales(por_clasificacion, "clasificacion", "horas_totales",
+                            "Horas por clasificación", "horas"),
     )
 
     izquierda, derecha = st.columns(2)
 
-    por_operador = (
-        filtrados.groupby("nombre_completo", as_index=False)["horas_trabajadas"].sum().head(20)
-    )
-    izquierda.altair_chart(
-        barras_horizontales(por_operador, "nombre_completo", "horas_trabajadas",
-                            "Horas trabajadas por operador", "horas"),
-    )
-
-    por_hacienda = filtrados.groupby("hda", as_index=False)["horas_trabajadas"].sum()
-    derecha.altair_chart(
-        barras_horizontales(por_hacienda, "hda", "horas_trabajadas",
-                            "Horas trabajadas por hacienda", "horas"),
-    )
-
-    por_dia = filtrados.dropna(subset=["fecha"]).groupby("fecha", as_index=False)["horas_trabajadas"].sum()
-    st.altair_chart(barras_por_dia(por_dia, "Horas trabajadas por día"))
-
-    izquierda, derecha = st.columns(2)
-    por_actividad = filtrados.groupby("actividad", as_index=False)["area_trabajada"].sum()
-    izquierda.altair_chart(
-        barras_horizontales(por_actividad, "actividad", "area_trabajada",
-                            "Área trabajada por actividad", "ha"),
-    )
-
-    por_equipo = (
-        filtrados.groupby("nombre_equipo", as_index=False)["horas_trabajadas"]
+    por_colaborador = (
+        filtrados.groupby("colaborador", as_index=False)["horas_totales"]
         .sum()
-        .nlargest(15, "horas_trabajadas")
+        .nlargest(20, "horas_totales")
     )
-    derecha.altair_chart(
-        barras_horizontales(por_equipo, "nombre_equipo", "horas_trabajadas",
-                            "Horas trabajadas por equipo", "horas"),
+    izquierda.altair_chart(
+        barras_horizontales(por_colaborador, "colaborador", "horas_totales",
+                            "Horas por colaborador", "horas"),
     )
 
-    st.subheader("Consolidado por operador")
-    tabla_operador = (
-        filtrados.groupby(["ficha", "nombre_completo"], as_index=False)
+    en_hacienda = filtrados[filtrados["hacienda_nombre"] != ""]
+    if en_hacienda.empty:
+        derecha.info("Ningún registro filtrado tiene hacienda.")
+    else:
+        por_hacienda = en_hacienda.groupby("hacienda_nombre", as_index=False)["horas_totales"].sum()
+        derecha.altair_chart(
+            barras_horizontales(por_hacienda, "hacienda_nombre", "horas_totales",
+                                "Horas por hacienda", "horas"),
+        )
+
+    por_dia = filtrados.dropna(subset=["fecha"]).groupby("fecha", as_index=False)["horas_totales"].sum()
+    st.altair_chart(barras_por_dia(por_dia, "horas_totales", "Horas por día"))
+
+    izquierda, derecha = st.columns(2)
+    por_actividad = (
+        filtrados.groupby("actividad", as_index=False)["horas_totales"]
+        .sum()
+        .nlargest(15, "horas_totales")
+    )
+    izquierda.altair_chart(
+        barras_horizontales(por_actividad, "actividad", "horas_totales",
+                            "Horas por actividad", "horas"),
+    )
+
+    if herramientas_filtradas.empty:
+        derecha.info("Ningún registro filtrado usó herramienta.")
+    else:
+        por_herramienta = (
+            herramientas_filtradas.groupby("herramienta", as_index=False)["herramienta_horas"]
+            .sum()
+            .nlargest(15, "herramienta_horas")
+        )
+        derecha.altair_chart(
+            barras_horizontales(por_herramienta, "herramienta", "herramienta_horas",
+                                "Horas de uso por herramienta", "horas"),
+        )
+
+    st.subheader("Consolidado por colaborador")
+    tabla_colaborador = (
+        filtrados.groupby(["ficha", "colaborador"], as_index=False)
         .agg(
+            dias=("fecha", "nunique"),
             registros=("clave", "count"),
-            horas=("horas_trabajadas", "sum"),
-            area=("area_trabajada", "sum"),
-            avance_horometro=("horometro_diferencia", "sum"),
+            horas=("horas_totales", "sum"),
+            adicionales=("horas_adicionales", "sum"),
+            horas_herramienta=("horas_herramienta", "sum"),
             alertas=("tiene_alerta", "sum"),
         )
         .sort_values("horas", ascending=False)
         .rename(
             columns={
                 "ficha": "Ficha",
-                "nombre_completo": "Operador",
+                "colaborador": "Colaborador",
+                "dias": "Días",
                 "registros": "Registros",
                 "horas": "Horas",
-                "area": "Área (ha)",
-                "avance_horometro": "Δ Horómetro",
+                "adicionales": "Horas adicionales",
+                "horas_herramienta": "Horas herramienta",
                 "alertas": "Alertas",
             }
         )
     )
-    st.dataframe(tabla_operador, hide_index=True, width="stretch")
+    st.dataframe(tabla_colaborador, hide_index=True, width="stretch")
 
 if vista_activa == "Detalle":
     st.subheader("Registros")
-    columnas_detalle = [c for c in ORDEN_COLUMNAS if c in filtrados.columns] + ["registrado_en"]
+    columnas_detalle = [c for c in ORDEN_COLUMNAS if c in filtrados.columns] + ["created_at"]
     vista = para_mostrar(filtrados, columnas_detalle)
     st.dataframe(
         vista,
@@ -1073,19 +1166,78 @@ if vista_activa == "Detalle":
         column_config=CONFIG_COLUMNAS,
     )
 
+    # El Excel lleva además una hoja con cada herramienta en su propia fila, que
+    # es como se digita el uso de equipos.
+    detalle_herramientas = herramientas_filtradas.merge(
+        filtrados[["fecha", "ficha", "colaborador", "codigo", "actividad", "hora_inicio", "hora_fin"]],
+        left_on="indice",
+        right_index=True,
+    )
+    hoja_herramientas = para_mostrar(
+        detalle_herramientas,
+        ["fecha", "ficha", "colaborador", "codigo", "actividad", "hora_inicio", "hora_fin",
+         "herramienta_ip", "herramienta_desc", "herramienta_horas"],
+    )
+
     descarga_1, descarga_2 = st.columns(2)
     descarga_1.download_button(
         "Descargar Excel",
-        a_excel({"Registros": para_exportar(vista)}),
-        file_name="labores_maquinaria.xlsx",
+        a_excel({
+            "Registros": para_exportar(vista),
+            "Herramientas": para_exportar(hoja_herramientas),
+        }),
+        file_name="actividades_ing_civil.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
     descarga_2.download_button(
         "Descargar CSV",
         a_csv(para_exportar(vista)),
-        file_name="labores_maquinaria.csv",
+        file_name="actividades_ing_civil.csv",
         mime="text/csv",
     )
+
+if vista_activa == "Vacaciones":
+    st.subheader("Vacaciones")
+    if vacaciones.empty:
+        st.info(
+            f"«{VACACIONES_TABLA}» no devolvió registros. Si la tabla tiene datos, revise "
+            "que exista la política de lectura (SELECT) para el rol `authenticated`."
+        )
+    else:
+        periodo = vacaciones
+        if desde is not None:
+            # Se muestran las que se cruzan con el rango, no sólo las que empiezan en él.
+            periodo = periodo[
+                (periodo["fecha_inicio"] <= hasta)
+                & (periodo["fecha_reintegro"].isna() | (periodo["fecha_reintegro"] > desde))
+            ]
+        if colaboradores:
+            periodo = periodo[periodo["colaborador"].isin(colaboradores)]
+
+        if periodo.empty:
+            st.info("No hay vacaciones que se crucen con los filtros seleccionados.")
+        else:
+            kpi_1, kpi_2, kpi_3 = st.columns(3)
+            kpi_1.metric("En curso", int((periodo["estado"] == "En curso").sum()))
+            kpi_2.metric("Programadas", int((periodo["estado"] == "Programadas").sum()))
+            kpi_3.metric("Finalizadas", int((periodo["estado"] == "Finalizadas").sum()))
+
+            tabla_vacaciones = para_mostrar(
+                periodo,
+                ["estado", "ficha", "colaborador", "fecha_inicio", "fecha_reintegro", "dias", "created_at"],
+            )
+            st.dataframe(
+                tabla_vacaciones,
+                hide_index=True,
+                width="stretch",
+                column_config=CONFIG_COLUMNAS,
+            )
+            st.download_button(
+                "Descargar Excel",
+                a_excel({"Vacaciones": para_exportar(tabla_vacaciones)}),
+                file_name="vacaciones_ing_civil.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
 
 if vista_activa == "Calidad de datos":
     st.subheader("Alertas encontradas")
@@ -1116,18 +1268,3 @@ if vista_activa == "Calidad de datos":
                     width="stretch",
                     column_config=CONFIG_COLUMNAS,
                 )
-
-    st.subheader("Observaciones de los operadores")
-    con_observacion = filtrados[filtrados["observaciones"].astype(str).str.strip() != ""]
-    if con_observacion.empty:
-        st.info("No hay observaciones en los registros filtrados.")
-    else:
-        st.dataframe(
-            para_mostrar(
-                con_observacion,
-                ["fecha", "nombre_completo", "ip_equipo", "hda", "ste", "actividad", "observaciones"],
-            ),
-            hide_index=True,
-            width="stretch",
-            column_config=CONFIG_COLUMNAS,
-        )

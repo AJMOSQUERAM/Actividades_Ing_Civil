@@ -7,6 +7,10 @@ supabase_*.sql
 
 # Exportaciones de datos: nunca deben publicarse
 *.csv
+*.xlsx
+
+# Flujo exportado de n8n: trae en texto plano el token del bot y la clave de Supabase
+Bot_Actividades_Ing_Civil.json
 
 # Archivos de trabajo que no hacen parte de la app
 *.pbix
