@@ -9,7 +9,9 @@ Ejecutar:  streamlit run app.py
 
 from __future__ import annotations
 
+import base64
 import io
+import json
 import os
 import time
 from pathlib import Path
@@ -22,28 +24,46 @@ BASE_DIR = Path(__file__).resolve().parent
 
 load_dotenv(BASE_DIR / ".env")
 
-def _config(*nombres: str, defecto: str = "") -> str:
-    """Toma el valor de los Secrets de Streamlit Cloud y, si no está, del .env local."""
-    for nombre in nombres:
-        try:
-            valor = st.secrets[nombre]
-        except Exception:  # sin archivo de secrets (ejecución local)
-            valor = None
-        if not valor:
-            valor = os.getenv(nombre)
-        if valor:
-            return str(valor).strip()
-    return defecto
+def _config(nombre: str, defecto: str = "") -> str:
+    """Toma el valor de los Secrets de Streamlit Cloud y, si no está, del .env local.
+
+    Recibe un único nombre a propósito: una cadena de alternativas permitiría que
+    una variable con otro nombre —por ejemplo una service_role— entrara sin que
+    nadie lo note.
+    """
+    try:
+        valor = st.secrets[nombre]
+    except Exception:  # sin archivo de secrets (ejecución local)
+        valor = None
+    if not valor:
+        valor = os.getenv(nombre)
+    return str(valor).strip() if valor else defecto
+
+
+def _rol_declarado(clave: str) -> str:
+    """Rol que declara la clave de Supabase, o cadena vacía si no se puede leer."""
+    if clave.startswith("sb_secret_"):
+        return "service_role"
+    if clave.startswith("sb_publishable_"):
+        return "anon"
+    if clave.count(".") != 2:  # no es un JWT: formato desconocido
+        return ""
+    try:
+        carga = clave.split(".")[1]
+        carga += "=" * (-len(carga) % 4)
+        return str(json.loads(base64.urlsafe_b64decode(carga)).get("role", ""))
+    except Exception:
+        return ""
 
 
 SUPABASE_URL = _config("SUPABASE_URL")
-SUPABASE_KEY = _config("SUPABASE_KEY", "SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_ANON_KEY")
-SUPABASE_TABLA = _config("SUPABASE_TABLE", defecto="registro_labores_maquinaria")
+SUPABASE_KEY = _config("SUPABASE_KEY")
+SUPABASE_TABLA = _config("SUPABASE_TABLE", "registro_labores_maquinaria")
 # Maestra de labores: el campo `labor` de cada registro es el código de la actividad.
-ACTIVIDADES_TABLA = _config("SUPABASE_ACTIVIDADES_TABLE", defecto="actividades")
+ACTIVIDADES_TABLA = _config("SUPABASE_ACTIVIDADES_TABLE", "actividades")
 # Maestra de equipos: asocia cada código de equipo con su descripción y su zona.
 # El nombre lleva mayúsculas y PostgREST es sensible a ellas.
-ZONAS_TABLA = _config("SUPABASE_ZONAS_TABLE", defecto="Maestro_Equipos_Zonas")
+ZONAS_TABLA = _config("SUPABASE_ZONAS_TABLE", "Maestro_Equipos_Zonas")
 
 # Paleta de marca, validada para fondo claro.
 #
@@ -809,6 +829,19 @@ if not (SUPABASE_URL and SUPABASE_KEY):
     st.error(
         "Faltan las credenciales de conexión. Configúrelas en el archivo .env "
         "(local) o en los Secrets de Streamlit Cloud."
+    )
+    st.stop()
+
+# La app debe conectarse con la clave anon. Una service_role omite RLS, con lo
+# que el control de acceso dejaría de existir, y además quedaría almacenada en
+# un servicio externo con permiso de escritura sobre toda la base. Antes esto
+# podía pasar inadvertido, así que se verifica al arrancar y se detiene.
+if _rol_declarado(SUPABASE_KEY) == "service_role":
+    st.error(
+        "La clave configurada es una **service_role** y esta aplicación no debe "
+        "usarla: omite las políticas RLS y anula el control de acceso. "
+        "Reemplácela por la clave **anon** del proyecto "
+        "(Supabase → Settings → API) en el .env o en los Secrets."
     )
     st.stop()
 

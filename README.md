@@ -63,9 +63,12 @@ completo para los contadores del encabezado.
 
 ## Configuración
 
-`_config(*nombres, defecto)` busca cada nombre primero en `st.secrets` (nube) y
+`_config(nombre, defecto)` busca el nombre primero en `st.secrets` (nube) y
 luego en las variables de entorno cargadas del `.env` (local). El mismo código
 corre en los dos lados sin ramas condicionales.
+
+Recibe **un único nombre** a propósito: una cadena de alternativas permitiría
+que una variable con otro nombre entrara sin que nadie lo note.
 
 | Variable | Obligatoria | Por defecto |
 |---|---|---|
@@ -79,12 +82,20 @@ Si faltan `SUPABASE_URL` o `SUPABASE_KEY`, la app se detiene con un mensaje ante
 de dibujar nada.
 
 `SUPABASE_KEY` debe ser la clave **anon**, nunca la `service_role`: esa omite
-RLS y anularía todo el control de acceso descrito abajo.
+RLS y anularía todo el control de acceso descrito abajo, y además quedaría
+almacenada en un servicio externo con permiso de escritura sobre toda la base.
 
-> **Pendiente conocido.** `_config` acepta además `SUPABASE_SERVICE_ROLE_KEY` y
-> `SUPABASE_ANON_KEY` como alternativas de `SUPABASE_KEY`. Si alguien define la
-> primera, la app la usaría sin avisar y se perdería RLS en silencio. Conviene
-> eliminar esa alternativa y validar el rol del token al arrancar.
+La app no se limita a documentarlo: `_rol_declarado()` lee el rol que declara la
+clave y, si es una `service_role`, **se detiene al arrancar** con un mensaje que
+explica qué reemplazar. Reconoce los dos formatos de Supabase:
+
+| Clave | Rol detectado | Resultado |
+|---|---|---|
+| JWT con `role: anon` | `anon` | arranca |
+| JWT con `role: service_role` | `service_role` | se detiene |
+| `sb_publishable_…` | `anon` | arranca |
+| `sb_secret_…` | `service_role` | se detiene |
+| formato desconocido | — | arranca (no se bloquea por no poder leerla) |
 
 ---
 
