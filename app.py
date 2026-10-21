@@ -13,9 +13,8 @@ import io
 import os
 import time
 from pathlib import Path
-
 import pandas as pd
-import plotly.graph_objects as go
+import altair as alt
 import streamlit as st
 from dotenv import load_dotenv
 
@@ -528,67 +527,69 @@ def marcar_alertas(df: pd.DataFrame) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 # Gráficos
 # --------------------------------------------------------------------------- #
-def _estilo(fig, titulo: str, alto: int) -> None:
-    fig.update_layout(
-        title=dict(text=titulo, font=dict(size=16, color=TINTA), x=0, xanchor="left"),
-        plot_bgcolor=SUPERFICIE,
-        paper_bgcolor=SUPERFICIE,
-        font=dict(size=13, color=TINTA_SUAVE),
-        margin=dict(l=8, r=36, t=52, b=8),
-        height=alto,
-        bargap=0.38,
-        showlegend=False,
-        hoverlabel=dict(bgcolor="#ffffff", font_size=13, bordercolor=REJILLA),
+def _afinar(grafico, titulo: str, alto: int):
+    """Estilo común: tipografía recesiva, sin marco y con el título a la izquierda."""
+    return (
+        grafico.properties(
+            height=alto,
+            title=alt.TitleParams(titulo, fontSize=16, color=TINTA, anchor="start", dy=-6),
+        )
+        .configure_view(strokeWidth=0)
+        .configure_axis(
+            labelColor=TINTA_SUAVE,
+            labelFontSize=12,
+            domainColor=REJILLA,
+            tickColor=REJILLA,
+            gridColor=REJILLA,
+        )
     )
 
 
 def barras_horizontales(datos: pd.DataFrame, categoria: str, valor: str, titulo: str,
                         unidad: str, color: str = VERDE, alto: int | None = None):
-    datos = datos.sort_values(valor, ascending=True)
-    fig = go.Figure(
-        go.Bar(
-            x=datos[valor],
-            y=datos[categoria].astype(str),
-            orientation="h",
-            marker=dict(color=color, line_width=0, cornerradius=4),
-            texttemplate="%{x:,.1f}",
-            textposition="outside",
-            textfont=dict(color=TINTA_SUAVE, size=12),
-            cliponaxis=False,
-            hovertemplate="<b>%{y}</b><br>%{x:,.2f} " + unidad + "<extra></extra>",
-        )
+    """Barras horizontales con el valor escrito al lado de cada barra.
+
+    Se usa Altair y no Plotly: Vega-Lite ya viene en el paquete de Streamlit
+    (281 KB) mientras Plotly agrega cerca de 2 MB de descarga en la primera
+    carga, que es lo que pesa cuando la conexión es lenta.
+    """
+    datos = datos.rename(columns={categoria: "categoria", valor: "valor"})
+    datos["categoria"] = datos["categoria"].astype(str)
+
+    base = alt.Chart(datos).encode(
+        # sort="-x" ordena por magnitud; el eje es nominal, así que los códigos
+        # de hacienda nunca se interpretan como números.
+        y=alt.Y("categoria:N", sort="-x", title=None, axis=alt.Axis(labelLimit=240)),
+        x=alt.X("valor:Q", title=None, axis=alt.Axis(grid=True, tickCount=4)),
+        tooltip=[
+            alt.Tooltip("categoria:N", title=" "),
+            alt.Tooltip("valor:Q", title=unidad, format=",.2f"),
+        ],
     )
-    fig.update_xaxes(showgrid=True, gridcolor=REJILLA, zeroline=False, title=None)
-    # type="category" evita que Plotly lea como número los códigos de hacienda o
-    # de actividad; automargin evita que se corten las etiquetas largas.
-    fig.update_yaxes(
-        showgrid=False,
-        title=None,
-        ticklabelposition="outside",
-        automargin=True,
-        type="category",
-    )
-    _estilo(fig, titulo, alto or max(220, 34 * len(datos) + 90))
-    return fig
+    barras = base.mark_bar(color=color, cornerRadiusEnd=4, height={"band": 0.62})
+    etiquetas = base.mark_text(
+        align="left", dx=6, color=TINTA_SUAVE, fontSize=12
+    ).encode(text=alt.Text("valor:Q", format=",.1f"))
+
+    alto = alto or max(170, 30 * len(datos) + 60)
+    return _afinar(barras + etiquetas, titulo, alto)
 
 
 def barras_por_dia(datos: pd.DataFrame, titulo: str):
-    fig = go.Figure(
-        go.Bar(
-            x=datos["fecha"],
-            y=datos["horas_trabajadas"],
-            marker=dict(color=VERDE, line_width=0, cornerradius=4),
-            texttemplate="%{y:,.1f}",
-            textposition="outside",
-            textfont=dict(color=TINTA_SUAVE, size=12),
-            cliponaxis=False,
-            hovertemplate="<b>%{x|%d/%m/%y}</b><br>%{y:,.2f} horas<extra></extra>",
-        )
+    datos = datos.rename(columns={"horas_trabajadas": "valor"})
+    base = alt.Chart(datos).encode(
+        x=alt.X("fecha:T", title=None, axis=alt.Axis(format="%d/%m", grid=False)),
+        y=alt.Y("valor:Q", title=None, axis=alt.Axis(grid=True, tickCount=4)),
+        tooltip=[
+            alt.Tooltip("fecha:T", title=" ", format="%d/%m/%y"),
+            alt.Tooltip("valor:Q", title="horas", format=",.2f"),
+        ],
     )
-    fig.update_xaxes(showgrid=False, title=None, tickformat="%d/%m", dtick="D1")
-    fig.update_yaxes(showgrid=True, gridcolor=REJILLA, zeroline=False, title=None)
-    _estilo(fig, titulo, 320)
-    return fig
+    barras = base.mark_bar(color=VERDE, cornerRadiusEnd=4, width={"band": 0.6})
+    etiquetas = base.mark_text(
+        dy=-9, color=TINTA_SUAVE, fontSize=12
+    ).encode(text=alt.Text("valor:Q", format=",.1f"))
+    return _afinar(barras + etiquetas, titulo, 280)
 
 
 # --------------------------------------------------------------------------- #
@@ -873,7 +874,6 @@ with st.sidebar:
     equipos = multiselector("ip_equipo", "Equipo")
     solo_alertas = st.checkbox("Sólo registros con alerta")
     solo_observaciones = st.checkbox("Sólo registros con observación")
-    st.caption("Los filtros de Zona y Hacienda están en la pestaña Detalle y aplican a todo el tablero.")
 
 # Opciones tomadas del conjunto completo, para que no cambien al filtrar.
 def _opciones(columna: str) -> list[str]:
@@ -936,14 +936,35 @@ columnas_kpi[3].metric("Operadores", filtrados["nombre_completo"].nunique())
 columnas_kpi[4].metric("Zonas", filtrados["zona"].nunique())
 columnas_kpi[5].metric("Con alerta", int(filtrados["tiene_alerta"].sum()))
 
-detalle, resumen, calidad = st.tabs(["Detalle", "Resumen", "Calidad de datos"])
+col_zona, col_hacienda = st.columns(2)
+col_zona.multiselect(
+    "Zona",
+    ZONAS_DISPONIBLES,
+    key="filtro_zona",
+    placeholder="Todas las zonas",
+    help="Filtra los equipos por zona. Aplica a las tres vistas.",
+)
+col_hacienda.multiselect(
+    "Hacienda",
+    HACIENDAS_DISPONIBLES,
+    key="filtro_hacienda",
+    placeholder="Todas las haciendas",
+    help="Aplica a las tres vistas.",
+)
 
-with resumen:
+# Un selector en lugar de pestañas: con st.tabs, Streamlit construye y envía las
+# tres vistas en cada interacción. Dibujando sólo la activa, cada cambio de
+# filtro manda un tercio de lo que mandaba.
+VISTAS = ["Detalle", "Resumen", "Calidad de datos"]
+vista_activa = st.segmented_control(
+    "Vista", VISTAS, default="Detalle", key="vista", label_visibility="collapsed"
+) or "Detalle"
+
+if vista_activa == "Resumen":
     por_zona = filtrados.groupby("zona", as_index=False)["horas_trabajadas"].sum()
-    st.plotly_chart(
+    st.altair_chart(
         barras_horizontales(por_zona, "zona", "horas_trabajadas",
                             "Horas trabajadas por zona", "horas"),
-        width="stretch",
     )
 
     izquierda, derecha = st.columns(2)
@@ -951,28 +972,25 @@ with resumen:
     por_operador = (
         filtrados.groupby("nombre_completo", as_index=False)["horas_trabajadas"].sum().head(20)
     )
-    izquierda.plotly_chart(
+    izquierda.altair_chart(
         barras_horizontales(por_operador, "nombre_completo", "horas_trabajadas",
                             "Horas trabajadas por operador", "horas"),
-        width="stretch",
     )
 
     por_hacienda = filtrados.groupby("hda", as_index=False)["horas_trabajadas"].sum()
-    derecha.plotly_chart(
+    derecha.altair_chart(
         barras_horizontales(por_hacienda, "hda", "horas_trabajadas",
                             "Horas trabajadas por hacienda", "horas"),
-        width="stretch",
     )
 
     por_dia = filtrados.dropna(subset=["fecha"]).groupby("fecha", as_index=False)["horas_trabajadas"].sum()
-    st.plotly_chart(barras_por_dia(por_dia, "Horas trabajadas por día"), width="stretch")
+    st.altair_chart(barras_por_dia(por_dia, "Horas trabajadas por día"))
 
     izquierda, derecha = st.columns(2)
     por_actividad = filtrados.groupby("actividad", as_index=False)["area_trabajada"].sum()
-    izquierda.plotly_chart(
+    izquierda.altair_chart(
         barras_horizontales(por_actividad, "actividad", "area_trabajada",
                             "Área trabajada por actividad", "ha"),
-        width="stretch",
     )
 
     por_equipo = (
@@ -980,10 +998,9 @@ with resumen:
         .sum()
         .nlargest(15, "horas_trabajadas")
     )
-    derecha.plotly_chart(
+    derecha.altair_chart(
         barras_horizontales(por_equipo, "nombre_equipo", "horas_trabajadas",
                             "Horas trabajadas por equipo", "horas"),
-        width="stretch",
     )
 
     st.subheader("Consolidado por operador")
@@ -1011,23 +1028,7 @@ with resumen:
     )
     st.dataframe(tabla_operador, hide_index=True, width="stretch")
 
-with detalle:
-    col_zona, col_hacienda = st.columns(2)
-    col_zona.multiselect(
-        "Zona",
-        ZONAS_DISPONIBLES,
-        key="filtro_zona",
-        placeholder="Todas las zonas",
-        help="Filtra los equipos por zona. Aplica también a Resumen y Calidad de datos.",
-    )
-    col_hacienda.multiselect(
-        "Hacienda",
-        HACIENDAS_DISPONIBLES,
-        key="filtro_hacienda",
-        placeholder="Todas las haciendas",
-        help="Aplica también a Resumen y Calidad de datos.",
-    )
-
+if vista_activa == "Detalle":
     st.subheader("Registros")
     columnas_detalle = [c for c in ORDEN_COLUMNAS if c in filtrados.columns] + ["registrado_en"]
     vista = para_mostrar(filtrados, columnas_detalle)
@@ -1045,17 +1046,15 @@ with detalle:
         a_excel({"Registros": para_exportar(vista)}),
         file_name="labores_maquinaria.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        width="stretch",
     )
     descarga_2.download_button(
         "Descargar CSV",
         a_csv(para_exportar(vista)),
         file_name="labores_maquinaria.csv",
         mime="text/csv",
-        width="stretch",
     )
 
-with calidad:
+if vista_activa == "Calidad de datos":
     st.subheader("Alertas encontradas")
     conteo = (
         alertas.loc[filtrados.index]
@@ -1068,10 +1067,9 @@ with calidad:
     if conteo.empty:
         st.success("Ningún registro filtrado presenta inconsistencias.")
     else:
-        st.plotly_chart(
+        st.altair_chart(
             barras_horizontales(conteo, "regla", "registros", "Registros por tipo de alerta",
                                 "registros", color=ROJO),
-            width="stretch",
         )
         for regla, descripcion in REGLAS.items():
             afectados = filtrados[alertas.loc[filtrados.index, regla]]

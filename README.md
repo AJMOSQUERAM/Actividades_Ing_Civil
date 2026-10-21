@@ -50,7 +50,8 @@ Streamlit re-ejecuta `app.py` completo en cada interacción. El orden importa:
    descripción.
 6. **Validación** — `marcar_alertas()` produce la matriz booleana de reglas.
 7. **Filtros** — la barra lateral recorta el DataFrame a `filtrados`.
-8. **Render** — tres pestañas: Detalle, Resumen, Calidad de datos.
+8. **Render** — una sola vista de las tres (Detalle, Resumen, Calidad de
+   datos), elegida con `st.segmented_control`.
 
 Todo lo que se dibuja parte de `filtrados`; `datos` conserva el conjunto
 completo para los contadores del encabezado.
@@ -146,6 +147,19 @@ crea por consulta:
 - `_cliente_sesion(usuario_id)` — uno por usuario, reutilizado entre reruns. El
   token tampoco entra en esta clave; `_cliente()` lo adjunta en cada uso con
   `postgrest.auth()`, que sólo reescribe una cabecera.
+
+### Lo que viaja al navegador
+
+El script corre en el servidor de Streamlit, que habla con Supabase servidor a
+servidor: **la consulta no pasa por la conexión del usuario**. Por ella viaja
+sólo la interfaz renderizada, y de ahí vienen las dos decisiones de estructura:
+
+- **Una vista a la vez.** Con `st.tabs`, Streamlit construye y envía las tres
+  vistas en cada interacción. Con el selector se dibuja sólo la activa, así que
+  un cambio de filtro manda un tercio de lo que mandaba.
+- **Los filtros de Zona y Hacienda van arriba del selector**, no dentro de una
+  vista. Si estuvieran dentro, Streamlit descartaría su valor al cambiar de
+  vista, porque el widget deja de renderizarse.
 
 ### Consultas
 
@@ -243,15 +257,23 @@ regla sin descripción no se muestra.
 
 ## Gráficos
 
-Dos constructores sobre `plotly.graph_objects`, ambos con el mismo tratamiento
-visual:
+Dos constructores sobre **Altair**, ambos con el mismo tratamiento visual:
 
 - `barras_horizontales()` — magnitudes por categoría.
 - `barras_por_dia()` — serie temporal.
 
-Se usa `graph_objects` y no `plotly.express` a propósito: `express` tarda ~250 ms
-en importarse contra ~70 ms de `graph_objects`, y en un contenedor que arranca en
-frío cada vez que la app despierta, ese tiempo se paga en cada visita.
+Se usa Altair y no Plotly por el peso que viaja al navegador. Medido sobre los
+archivos del paquete, ya comprimidos:
+
+| Librería de gráficos | Descarga |
+|---|---|
+| Plotly | 1.966 KB |
+| Vega-Lite (Altair y `st.*_chart`) | 281 KB |
+
+Vega-Lite ya viene en el paquete de Streamlit; los chunks de Plotly se descargan
+aparte la primera vez que aparece un gráfico. Para comparar, la tabla completa
+con 5.000 registros pesa 82 KB y cada especificación de gráfico menos de 1 KB:
+el cuello de botella en una conexión lenta es la librería, no los datos.
 
 Decisiones que conviene no revertir sin motivo:
 
