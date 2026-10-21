@@ -43,13 +43,16 @@ Streamlit re-ejecuta `app.py` completo en cada interacción. El orden importa:
 1. **Configuración** — `_config()` resuelve las variables de entorno.
 2. **Autenticación** — `token_activo()`. Sin token válido se dibuja
    `pantalla_ingreso()` y `st.stop()` corta ahí.
-3. **Carga** — `obtener_datos(token)` → `cargar_registros()` (cacheada).
+3. **Carga** — `obtener_datos(usuario_id, token)` → `cargar_registros()`
+   (cacheada).
 4. **Normalización** — `normalizar()` convierte tipos y deriva columnas.
 5. **Enriquecimiento** — `agregar_actividades()` traduce el código de labor y
    `agregar_zonas()` cruza el equipo contra la maestra para traer zona y
    descripción.
 6. **Validación** — `marcar_alertas()` produce la matriz booleana de reglas.
-7. **Filtros** — la barra lateral recorta el DataFrame a `filtrados`.
+7. **Filtros** — Zona y Hacienda (sobre el selector de vista) más Operador,
+   Suerte, Actividad y Equipo (barra lateral) recortan el DataFrame a
+   `filtrados`.
 8. **Render** — una sola vista de las tres (Detalle, Resumen, Calidad de
    datos), elegida con `st.segmented_control`.
 
@@ -67,12 +70,21 @@ corre en los dos lados sin ramas condicionales.
 | Variable | Obligatoria | Por defecto |
 |---|---|---|
 | `SUPABASE_URL` | sí | — |
-| `SUPABASE_KEY` | sí | también acepta `SUPABASE_SERVICE_ROLE_KEY` o `SUPABASE_ANON_KEY` |
+| `SUPABASE_KEY` | sí | — |
 | `SUPABASE_TABLE` | no | `registro_labores_maquinaria` |
 | `SUPABASE_ACTIVIDADES_TABLE` | no | `actividades` |
+| `SUPABASE_ZONAS_TABLE` | no | `Maestro_Equipos_Zonas` |
 
 Si faltan `SUPABASE_URL` o `SUPABASE_KEY`, la app se detiene con un mensaje antes
 de dibujar nada.
+
+`SUPABASE_KEY` debe ser la clave **anon**, nunca la `service_role`: esa omite
+RLS y anularía todo el control de acceso descrito abajo.
+
+> **Pendiente conocido.** `_config` acepta además `SUPABASE_SERVICE_ROLE_KEY` y
+> `SUPABASE_ANON_KEY` como alternativas de `SUPABASE_KEY`. Si alguien define la
+> primera, la app la usaría sin avisar y se perdería RLS en silencio. Conviene
+> eliminar esa alternativa y validar el rol del token al arrancar.
 
 ---
 
@@ -82,12 +94,12 @@ Implementada sobre Supabase Auth (correo y contraseña).
 
 - `iniciar_sesion()` llama a `sign_in_with_password` y traduce los errores
   crudos a mensajes en español. Guarda la sesión en `st.session_state["sesion"]`
-  (`access_token`, `refresh_token`, `expira_en`, `correo`).
+  (`access_token`, `refresh_token`, `expira_en`, `correo`, `id`).
 - `token_activo()` se ejecuta en cada rerun. Si al token le quedan menos de
   `MARGEN_REFRESCO` segundos (120), lo renueva con `refresh_session`. Si la
   renovación falla, descarta la sesión y devuelve `None`, con lo que el usuario
   vuelve al formulario.
-- `_cliente(token)` crea el cliente y, cuando hay token, llama a
+- `_cliente(usuario_id, token)` toma el cliente cacheado del usuario y llama a
   `cliente.postgrest.auth(token)`. Desde ese punto las consultas llegan a
   Postgres como rol `authenticated` y RLS decide qué filas devuelve.
 - `cerrar_sesion()` cierra la sesión remota, borra `session_state` y limpia la
@@ -104,7 +116,7 @@ Supabase; no forman parte de este repositorio.
 ### Alcance
 
 Todo usuario autenticado lee todos los registros. La **zona es un filtro de
-visualización** en la barra lateral, no un permiso: sirve para que cada persona
+visualización**, sobre el selector de vista, no un permiso: sirve para que cada persona
 se concentre en su área, no para impedirle ver las demás.
 
 La restricción por usuario quedó preparada pero no activa. Está documentada en
@@ -190,7 +202,7 @@ El botón **Actualizar datos** llama a `st.cache_data.clear()`.
 | `horometro_inicio`, `horometro_final`, `horometro_diferencia` | numérico | |
 | `horas_trabajadas`, `area_trabajada` | numérico | Acepta coma o punto decimal. |
 | `observaciones` | texto | |
-| `registrado_en` | datetime | Llega en UTC; se resta 5 h fijas para hora de Colombia. Se muestra como *Fecha digitación*. |
+| `registrado_en` | datetime | Llega en UTC con precisión variable (`format="ISO8601"`); se resta 5 h fijas para hora de Colombia. Se muestra como *Fecha digitación*. Ver *Fechas*. |
 
 Las columnas internas de la tabla (`id_registro`, `fecha_original`,
 `telegram_chat_id`, `telegram_usuario`) se cargan pero nunca se muestran: la
@@ -250,7 +262,7 @@ regla es la que detecta el error habitual de anotar kilometraje en el campo del
 horómetro.
 
 Para agregar una regla: añada la fila en `marcar_alertas()` **y** la entrada
-correspondiente en `REGLAS`. La pestaña de calidad recorre `REGLAS`, así que una
+correspondiente en `REGLAS`. La vista de calidad recorre `REGLAS`, así que una
 regla sin descripción no se muestra.
 
 ---
@@ -277,18 +289,66 @@ el cuello de botella en una conexión lenta es la librería, no los datos.
 
 Decisiones que conviene no revertir sin motivo:
 
-- **`type="category"` en el eje Y.** Los códigos de hacienda llegan como
-  `'080104'`. Plotly infiere el tipo de eje en el navegador y, al ver cadenas
-  con forma de número, las convierte a magnitudes (aparecía `82.5k` como marca
-  de eje). Forzar el eje categórico lo evita.
-- **`automargin=True`.** Los nombres de actividad son largos; sin esto se cortan.
-- **Sin truncar etiquetas.** Dos nombres con el mismo prefijo colapsarían en una
-  sola categoría y sumarían barras.
+- **Encoding nominal (`categoria:N`) en el eje Y.** Los códigos de hacienda
+  llegan como `'080104'`. Un eje cuantitativo los leería como magnitudes: en la
+  versión con Plotly el eje llegó a mostrar `82.5k` como marca.
+- **`sort="-x"`.** Ordena las barras por magnitud, no por nombre.
+- **`labelLimit=240`.** Los nombres de actividad son largos; con el límite por
+  defecto quedan recortados con elipsis.
+- **Sin truncar las categorías en los datos.** Dos nombres con el mismo prefijo
+  colapsarían en una sola barra y sumarían sus valores.
+- **Valor escrito al lado de cada barra.** No es decoración: el verde de marca
+  da 2.21:1 contra el fondo, por debajo del umbral de 3:1 para marcas de datos,
+  así que el color nunca es lo único que comunica la magnitud.
 
-La paleta está en las constantes `AZUL`, `NARANJA`, `AQUA`, `ROJO`, `TINTA`,
-`TINTA_SUAVE`, `SUPERFICIE` y `REJILLA`. Son valores validados para fondo claro;
-el tema claro se fija en [.streamlit/config.toml](.streamlit/config.toml) para
-que el navegador del usuario no altere el contraste.
+### Paleta
+
+| Constante | Uso |
+|---|---|
+| `VERDE` `#7DBE00` | Color institucional. Pinta todas las barras de magnitud. |
+| `VERDE_OSCURO` `#4e7a00` | El único que admite texto blanco encima (5.1:1). |
+| `VERDE_TENUE` `#eff7e0` | Fondos suaves. |
+| `ROJO` `#e34948` | Reservado para estado (alertas). No se usa como color de serie. |
+| `TINTA`, `TINTA_SUAVE` | Texto principal y secundario. |
+| `SUPERFICIE`, `REJILLA` | Fondo y líneas de rejilla. |
+
+Sobre `VERDE` el texto va **oscuro** (8.7:1), nunca blanco (2.3:1). Como las
+series son únicas, cada gráfico se distingue por su título y no por el matiz.
+
+El tema claro se fija en [.streamlit/config.toml](.streamlit/config.toml) para
+que la preferencia del navegador no altere el contraste.
+
+---
+
+## Fechas
+
+El formato de presentación es **DD/MM/AA** y vive en una sola constante,
+`FORMATO_FECHA`. Aplica igual a `fecha` y a `registrado_en` (*Fecha digitación*).
+
+Tres detalles que no son evidentes:
+
+- **Las tablas reciben fechas, no texto.** `para_mostrar()` no convierte a
+  cadena a propósito: si lo hiciera, al hacer clic en el encabezado la tabla
+  ordenaría alfabéticamente y mandaría el día antes que el mes (`01/12/26` antes
+  de `14/09/26`). El formato lo aplica `CONFIG_COLUMNAS` con
+  `st.column_config.DateColumn`, de modo que el orden sigue el valor real.
+- **Las exportaciones sí van formateadas.** `para_exportar()` convierte las
+  fechas a texto justo antes de generar el Excel o el CSV. Sin eso el CSV
+  saldría en formato ISO.
+- **`registrado_en` se parsea con `format="ISO8601"`.** Postgres recorta los
+  microsegundos en cero, así que la misma columna trae `...02.384+00` y
+  `...00+00`. Con inferencia automática pandas toma el formato de la primera
+  fila y convierte el resto a `NaT`, dejando celdas vacías al azar.
+
+---
+
+## Estado de carga
+
+La tarjeta "Cargando registros" se muestra sólo mientras la sesión no tenga
+datos, controlada por `st.session_state["datos_listos"]`. En los reruns por
+cambio de filtro los datos vienen de la caché; mostrarla ahí daba la impresión
+de que la app volvía a consultar la base. `cerrar_sesion()` borra el marcador
+para que el siguiente ingreso vuelva a mostrarla.
 
 ---
 
@@ -299,7 +359,9 @@ que el navegador del usuario no altere el contraste.
 | Cambiar cómo se llama un campo en pantalla | `ETIQUETAS` |
 | Mostrar u ocultar columnas del detalle, o reordenarlas | `ORDEN_COLUMNAS` |
 | Agregar una validación | `marcar_alertas()` + `REGLAS` |
-| Agregar un filtro | `multiselector()` en la barra lateral + el bucle que aplica los filtros |
+| Agregar un filtro global | `_opciones()` + `_seleccion()` arriba del selector de vista, y el bucle que aplica los filtros |
+| Agregar un filtro secundario | `multiselector()` en la barra lateral |
+| Cambiar el formato de las fechas | `FORMATO_FECHA` y `CONFIG_COLUMNAS` |
 | Cambiar colores | Las constantes de paleta y `.streamlit/config.toml` |
 | Cambiar el formato de exportación | `a_excel()` / `a_csv()` |
 
@@ -310,7 +372,7 @@ que el navegador del usuario no altere el contraste.
 - **Zona horaria fija.** `registrado_en` se ajusta restando 5 horas. Es correcto
   para Colombia, que no aplica horario de verano, pero rompería en otra zona.
 - **Sólo lectura.** No hay forma de corregir un registro desde el tablero; las
-  inconsistencias que muestra la pestaña de calidad se corrigen en el origen.
+  inconsistencias que muestra la vista de calidad se corrigen en el origen.
 - **Estado no compartido.** Filtros y sesión viven en `st.session_state`, es
   decir por pestaña del navegador. Nada se persiste entre visitas.
 - **Sin paginación en la interfaz.** Todo el conjunto filtrado se carga en
