@@ -2,8 +2,9 @@
 
 Tablero en Streamlit que consulta los registros diarios del área de ingeniería
 civil capturados por un bot de Telegram: labores, cuentas control, novedades,
-uso de herramientas y vacaciones. Es una aplicación de **sólo lectura**: no
-escribe nada en la base de datos.
+uso de herramientas y vacaciones. Además permite **corregir el horario y las
+horas adicionales** de un registro y llevar el **banco de horas** de cada
+colaborador. Ver *Edición y banco de horas*.
 
 Todo el tablero vive en un único archivo, [app.py](app.py).
 
@@ -56,11 +57,11 @@ Streamlit re-ejecuta `app.py` completo en cada interacción. El orden importa:
    a una tabla larga (una fila por herramienta) y resume cada registro.
 6. **Validación**: `marcar_alertas()` produce la matriz booleana de reglas,
    incluido el cruce contra vacaciones.
-7. **Filtros**: Clasificación y Hacienda (sobre el selector de vista) más
+7. **Filtros**: Clasificación, Hacienda y Horas adicionales (sobre el selector de vista) más
    Colaborador, Actividad y Herramienta (barra lateral) recortan el DataFrame a
    `filtrados`.
-8. **Render**: una sola vista de las cuatro (Detalle, Resumen, Vacaciones,
-   Calidad de datos), elegida con `st.segmented_control`.
+8. **Render**: una sola vista de las cinco (Detalle, Resumen, Banco de horas,
+   Vacaciones, Calidad de datos), elegida con `st.segmented_control`.
 
 Todo lo que se dibuja parte de `filtrados`; `datos` conserva el conjunto
 completo para los contadores del encabezado.
@@ -82,6 +83,8 @@ que una variable con otro nombre entrara sin que nadie lo note.
 | `SUPABASE_KEY` | sí | — |
 | `SUPABASE_TABLE` | no | `civil_registros` |
 | `SUPABASE_VACACIONES_TABLE` | no | `civil_vacaciones` |
+| `SUPABASE_BANCO_TABLE` | no | `civil_banco_horas` |
+| `SUPABASE_EDICIONES_TABLE` | no | `civil_registros_ediciones` |
 
 Si faltan `SUPABASE_URL` o `SUPABASE_KEY`, la app se detiene con un mensaje antes
 de dibujar nada.
@@ -136,6 +139,9 @@ políticas están en `supabase_politicas_civil.sql` (local, no se publica): acti
 RLS en `civil_registros` y `civil_vacaciones` y conceden `SELECT` al rol
 `authenticated`. El bot no se ve afectado porque escribe con `service_role`.
 
+Los permisos de escritura están en `supabase_edicion_banco.sql`, descrito en
+*Edición y banco de horas*.
+
 ---
 
 ## Caché
@@ -146,6 +152,10 @@ RLS en `civil_registros` y `civil_vacaciones` y conceden `SELECT` al rol
 |---|---|---|
 | `cargar_registros` | 300 s | `(tabla, usuario_id)` |
 | `cargar_vacaciones` | 300 s | `(tabla, usuario_id)` |
+| `cargar_banco` | 300 s | `(tabla, usuario_id)` |
+
+Toda escritura termina en `avisar_y_recargar()`, que limpia la caché: después de
+guardar, la pantalla muestra lo que quedó en la base y no una copia vieja.
 
 El `usuario_id` forma parte de la clave para que un usuario no reciba datos
 traídos con las credenciales de otro. El **token no entra en la clave**: se pasa
@@ -280,6 +290,75 @@ regla sin descripción no se muestra.
 
 ---
 
+## Edición y banco de horas
+
+### Por qué no se usa la `service_role`
+
+La app escribe con el **token de quien inició sesión**, igual que lee. Los
+permisos los dan las políticas de `supabase_edicion_banco.sql`, no una clave
+maestra. Así:
+
+- La `service_role` no sale de n8n, y la app sigue negándose a arrancar con ella.
+- La base sabe quién hizo cada cambio: `registrado_por` y `editado_por` se
+  llenan con el correo del token (valor por defecto de la columna), no con algo
+  que envíe la app.
+- Para limitar la edición a algunos usuarios basta cambiar la política
+  (sección 5 del SQL); la app no se toca.
+
+Además, con la `service_role` no se habría ganado nada: la app adjunta el token
+del usuario a cada consulta, y PostgREST decide el rol por ese token, no por la
+clave.
+
+### Edición de registros
+
+En **Detalle**, el interruptor *Editar registros* cambia la tabla por un
+`st.data_editor`. Se pueden editar `hora_inicio`, `hora_fin`,
+`horas_adicionales` y `tipo_hora_adicional` (`COLUMNAS_EDITABLES`); lo demás
+queda bloqueado.
+
+`preparar_cambios()` valida cada fila antes de enviarla y recalcula lo que
+depende de ella:
+
+- `horas_totales` = `hora_fin − hora_inicio`.
+- `horas_normales` = `horas_totales − horas_adicionales`.
+- Sin horas adicionales, `tipo_hora_adicional` queda nulo.
+
+Las validaciones adelantan lo que la base rechazaría (formato HH:MM, inicio
+antes de las 06:00, fin antes del inicio, adicionales sin tipo). Lo que sólo la
+base puede saber, como el cruce con otro tramo del mismo colaborador, vuelve
+como error y `_traducir_error()` lo convierte en un mensaje legible
+(`ERRORES_BASE`).
+
+`guardar_ediciones()` guarda **fila por fila**: un error en una no impide
+guardar las demás. Si la política no permite actualizar, PostgREST no da error
+sino cero filas; la app lo revisa y lo reporta. Cada campo cambiado queda en
+`civil_registros_ediciones` con el valor anterior, el nuevo, quién y cuándo.
+
+La clave del editor cambia después de cada guardado (`version_editor`). El
+editor recuerda los cambios por posición de fila, y con los datos recargados
+los aplicaría a otra fila.
+
+### Banco de horas
+
+Cada movimiento es una fila de `civil_banco_horas` con horas con signo. El
+signo lo fija el motivo (`MOTIVOS_BANCO`), no quien digita, y la base lo
+verifica (`chk_banco_motivo`):
+
+| Motivo | Signo | Cuándo |
+|---|---|---|
+| `reporte_sin_asistencia` | + | Se le reportan horas en una actividad y no viene a trabajar. |
+| `asistencia_sin_reporte` | − | Viene a trabajar el día completo y no se le reportan actividades. |
+
+La vista muestra el saldo por colaborador (histórico, no depende del rango de
+fechas), los movimientos del rango y permite eliminar uno seleccionándolo en la
+tabla y confirmando.
+
+Las horas adicionales que el bot registra como *banco* aparecen en la columna
+*Banco reportado por el bot* **sin sumarse al saldo**: falta definir con qué
+signo entran frente a los movimientos manuales.
+
+---
+
 ## Gráficos
 
 Dos constructores sobre **Altair**, ambos con el mismo tratamiento visual:
@@ -372,6 +451,8 @@ para que el siguiente ingreso vuelva a mostrarla.
 | Cambiar cómo se llama un campo en pantalla | `ETIQUETAS` |
 | Mostrar u ocultar columnas del detalle, o reordenarlas | `ORDEN_COLUMNAS` |
 | Agregar una validación | `marcar_alertas()` + `REGLAS` |
+| Permitir editar otra columna | `COLUMNAS_EDITABLES`, `preparar_cambios()` y la configuración del editor en Detalle |
+| Agregar un motivo de banco de horas | `MOTIVOS_BANCO` y la restricción `chk_banco_motivo` |
 | Cambiar la duración de la jornada | `JORNADA_HORAS` |
 | Traducir una clave nueva del bot | Los diccionarios `NOMBRES_*` |
 | Agregar un filtro global | `_opciones()` + `_seleccion()` arriba del selector de vista, y el bucle que aplica los filtros |
@@ -386,8 +467,9 @@ para que el siguiente ingreso vuelva a mostrarla.
 
 - **Zona horaria fija.** `created_at` y el estado de las vacaciones se ajustan restando 5 horas. Es correcto
   para Colombia, que no aplica horario de verano, pero rompería en otra zona.
-- **Sólo lectura.** No hay forma de corregir un registro desde el tablero; las
-  inconsistencias que muestra la vista de calidad se corrigen en el origen.
+- **Edición acotada.** Desde el tablero sólo se corrigen horario y horas
+  adicionales. Cambiar la labor, la hacienda o las herramientas se hace en el
+  origen.
 - **Estado no compartido.** Filtros y sesión viven en `st.session_state`, es
   decir por pestaña del navegador. Nada se persiste entre visitas.
 - **Sin paginación en la interfaz.** Todo el conjunto filtrado se carga en
@@ -406,3 +488,4 @@ para que el siguiente ingreso vuelva a mostrarla.
 | [.env.example](.env.example) | Plantilla de variables locales. |
 | [.streamlit/secrets.toml.example](.streamlit/secrets.toml.example) | Plantilla de variables en la nube. |
 | `supabase_politicas_civil.sql` | Políticas RLS de lectura. Local, no se publica. |
+| `supabase_edicion_banco.sql` | Tablas de banco de horas y bitácora, y políticas de escritura. Local, no se publica. |

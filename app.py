@@ -14,6 +14,7 @@ import base64
 import io
 import json
 import os
+import re
 import time
 from pathlib import Path
 import pandas as pd
@@ -61,6 +62,10 @@ SUPABASE_URL = _config("SUPABASE_URL")
 SUPABASE_KEY = _config("SUPABASE_KEY")
 SUPABASE_TABLA = _config("SUPABASE_TABLE", "civil_registros")
 VACACIONES_TABLA = _config("SUPABASE_VACACIONES_TABLE", "civil_vacaciones")
+# Movimientos manuales del banco de horas y bitácora de ediciones hechas desde
+# el tablero. Las crea supabase_edicion_banco.sql.
+BANCO_TABLA = _config("SUPABASE_BANCO_TABLE", "civil_banco_horas")
+EDICIONES_TABLA = _config("SUPABASE_EDICIONES_TABLE", "civil_registros_ediciones")
 
 # Jornada ordinaria (06:00 a 15:00). Un día que no la complete, o que la supere
 # sin reportar horas adicionales, queda marcado en la vista de calidad.
@@ -121,14 +126,19 @@ ETIQUETAS = {
     "fecha_reintegro": "Reintegro",
     "dias": "Días",
     "estado": "Estado",
+    "horas": "Horas",
+    "movimiento": "Movimiento",
+    "observacion": "Observación",
+    "registrado_por": "Registrado por",
 }
 
 FORMATO_FECHA = "%d/%m/%y"  # DD/MM/AA, igual en fecha y fecha de digitación
 
-# Columnas que se piden a la base. Se excluyen las internas (id, id_registro,
-# origen, chat_id) y las que el bot no llena (labor_grupo, clase_labor).
+# Columnas que se piden a la base. Se excluyen las internas (origen, chat_id) y
+# las que el bot no llena (labor_grupo, clase_labor). `id` e `id_registro` no se
+# muestran, pero hacen falta para editar y para la bitácora.
 COLUMNAS_CONSULTA = ",".join([
-    "ficha", "colaborador", "fecha", "tipo_registro", "labor_codigo", "labor_desc",
+    "id", "id_registro", "ficha", "colaborador", "fecha", "tipo_registro", "labor_codigo", "labor_desc",
     "cuenta_control", "cuenta_desc", "ubicacion_tipo", "hacienda_codigo",
     "hacienda_nombre", "zona_cosecha", "hora_inicio", "hora_fin", "horas_totales",
     "uso_herramienta", "herramienta_ip", "herramienta_desc", "herramienta_horas",
@@ -136,6 +146,7 @@ COLUMNAS_CONSULTA = ",".join([
     "horas_adicionales", "tipo_hora_adicional", "created_at",
 ])
 COLUMNAS_VACACIONES = "ficha,colaborador,fecha_inicio,fecha_reintegro,dias,created_at"
+COLUMNAS_BANCO = "id,ficha,colaborador,fecha,horas,motivo,observacion,registrado_por,created_at"
 
 COLUMNAS_NUMERICAS = [
     "horas_totales",
@@ -182,6 +193,22 @@ NOMBRES_NOVEDAD = {
     "permiso_cita_medica": "Permiso por cita médica",
 }
 NOMBRES_HORA_ADICIONAL = {"extra": "Extra", "banco": "Banco de horas"}
+CLAVES_HORA_ADICIONAL = {nombre: clave for clave, nombre in NOMBRES_HORA_ADICIONAL.items()}
+
+# Movimientos manuales del banco de horas. El signo lo decide el motivo, no
+# quien digita: así no hay forma de registrar una resta con horas positivas.
+MOTIVOS_BANCO = {
+    "reporte_sin_asistencia": {
+        "nombre": "Sumar al banco (+)",
+        "detalle": "Se le reportan horas en una actividad y no viene a trabajar.",
+        "signo": 1,
+    },
+    "asistencia_sin_reporte": {
+        "nombre": "Restar del banco (−)",
+        "detalle": "Viene a trabajar el día completo y no se le reportan actividades.",
+        "signo": -1,
+    },
+}
 
 # Orden de columnas en las tablas de detalle.
 ORDEN_COLUMNAS = [
@@ -469,6 +496,203 @@ def obtener_vacaciones(usuario_id: str, token: str) -> pd.DataFrame:
     if vacaciones.empty:
         return vacaciones
     return normalizar_vacaciones(vacaciones)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cargar_banco(tabla: str, usuario_id: str, _token: str) -> pd.DataFrame:
+    return _descargar(tabla, usuario_id, _token, COLUMNAS_BANCO)
+
+
+def obtener_banco(usuario_id: str, token: str) -> pd.DataFrame | None:
+    """Movimientos manuales del banco de horas, o None si la tabla no se puede leer."""
+    try:
+        banco = cargar_banco(BANCO_TABLA, usuario_id, token)
+    except Exception:
+        return None
+    columnas = COLUMNAS_BANCO.split(",")
+    banco = banco.reindex(columns=columnas) if not banco.empty else pd.DataFrame(columns=columnas)
+    banco["fecha"] = _a_fecha(banco["fecha"])
+    banco["created_at"] = _a_digitacion(banco["created_at"])
+    banco["horas"] = pd.to_numeric(banco["horas"], errors="coerce").fillna(0)
+    for columna in ("ficha", "colaborador", "motivo", "observacion", "registrado_por"):
+        banco[columna] = banco[columna].fillna("").astype(str).str.strip()
+    banco["movimiento"] = banco["motivo"].map(
+        {clave: motivo["nombre"] for clave, motivo in MOTIVOS_BANCO.items()}
+    ).fillna(banco["motivo"])
+    return banco.sort_values(["fecha", "created_at"], ascending=False).reset_index(drop=True)
+
+
+# --------------------------------------------------------------------------- #
+# Escritura: edición de registros y banco de horas
+# --------------------------------------------------------------------------- #
+# Toda escritura viaja con el token de quien inició sesión, igual que la
+# lectura: lo que se puede cambiar lo deciden las políticas RLS, no la app. Las
+# reglas de abajo sólo adelantan, con un mensaje claro, lo que la base rechazaría.
+COLUMNAS_EDITABLES = ["hora_inicio", "hora_fin", "horas_adicionales", "tipo_hora_adicional"]
+FORMATO_HORA = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+
+# Nombre de la restricción de la base → mensaje para quien edita.
+ERRORES_BASE = {
+    "sin_cruce_horario": "El horario se cruza con otro registro del mismo colaborador ese día.",
+    "chk_horario": "La hora fin debe ser posterior a la hora inicio.",
+    "chk_jornada_inicio": "La jornada no puede empezar antes de las 06:00.",
+    "chk_horas_adicionales": "Si hay horas adicionales, indique si son extra o banco de horas.",
+    "chk_herramienta": "Las horas de la herramienta quedarían por encima de las horas del registro.",
+    "horas_totales_check": "Las horas del registro deben ser mayores que cero.",
+}
+
+
+def _traducir_error(error: Exception) -> str:
+    texto = str(error)
+    for restriccion, mensaje in ERRORES_BASE.items():
+        if restriccion in texto:
+            return mensaje
+    if "row-level security" in texto or "permission denied" in texto:
+        return "Su usuario no tiene permiso para hacer este cambio."
+    return texto
+
+
+def _nulo(valor) -> bool:
+    return valor is None or (isinstance(valor, float) and pd.isna(valor)) or valor == ""
+
+
+def _iguales(a, b) -> bool:
+    if _nulo(a) or _nulo(b):
+        return _nulo(a) and _nulo(b)
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return abs(float(a) - float(b)) < 0.005
+    return str(a) == str(b)
+
+
+def preparar_cambios(antes: pd.Series, despues: pd.Series) -> tuple[dict, dict, str | None]:
+    """Valida una fila editada y calcula los campos que dependen de ella.
+
+    Devuelve (cambios, valores anteriores, error). Las horas del registro salen
+    siempre del horario y las normales de restarles las adicionales: así nunca
+    quedan descuadradas con lo que se editó.
+    """
+    inicio = str(despues["hora_inicio"] or "").strip()
+    fin = str(despues["hora_fin"] or "").strip()
+    if not (FORMATO_HORA.match(inicio) and FORMATO_HORA.match(fin)):
+        return {}, {}, "Escriba las horas como HH:MM, por ejemplo 07:30."
+    desde, hasta = (_a_horas(pd.Series([h])).iloc[0] for h in (inicio, fin))
+    if desde < 6:
+        return {}, {}, ERRORES_BASE["chk_jornada_inicio"]
+    if hasta <= desde:
+        return {}, {}, ERRORES_BASE["chk_horario"]
+
+    totales = round(hasta - desde, 2)
+    adicionales = pd.to_numeric(despues["horas_adicionales"], errors="coerce")
+    adicionales = 0.0 if pd.isna(adicionales) else round(float(adicionales), 2)
+    if adicionales < 0 or adicionales > totales:
+        return {}, {}, f"Las horas adicionales deben estar entre 0 y {totales:g}."
+    tipo = CLAVES_HORA_ADICIONAL.get(despues["tipo_hora_adicional"] or "")
+    if adicionales > 0 and not tipo:
+        return {}, {}, ERRORES_BASE["chk_horas_adicionales"]
+    if adicionales == 0:
+        tipo = None
+
+    nuevos = {
+        "hora_inicio": inicio,
+        "hora_fin": fin,
+        "horas_totales": totales,
+        "horas_normales": round(totales - adicionales, 2),
+        "horas_adicionales": adicionales,
+        "tipo_hora_adicional": tipo,
+    }
+    anteriores = {
+        "hora_inicio": antes["hora_inicio"],
+        "hora_fin": antes["hora_fin"],
+        "horas_totales": float(antes["horas_totales"]),
+        "horas_normales": None if pd.isna(antes["horas_normales"]) else float(antes["horas_normales"]),
+        "horas_adicionales": float(antes["horas_adicionales"]),
+        "tipo_hora_adicional": CLAVES_HORA_ADICIONAL.get(antes["tipo_hora_adicional"]),
+    }
+    cambios = {k: v for k, v in nuevos.items() if not _iguales(v, anteriores[k])}
+    return cambios, anteriores, None
+
+
+def guardar_ediciones(antes: pd.DataFrame, despues: pd.DataFrame,
+                      usuario_id: str, token: str) -> tuple[int, list[str]]:
+    """Aplica las filas editadas una por una y deja cada cambio en la bitácora.
+
+    `antes` y `despues` van indexados por el `id` del registro. Se guarda fila
+    por fila para que un error en una no impida guardar las demás.
+    """
+    cliente = _cliente(usuario_id, token)
+    tocadas = [
+        i for i in despues.index
+        if any(not _iguales(antes.at[i, c], despues.at[i, c]) for c in COLUMNAS_EDITABLES)
+    ]
+    guardados, errores = 0, []
+    for id_ in tocadas:
+        fila = antes.loc[id_]
+        etiqueta = f"{fila['colaborador']} · {fila['fecha']:%d/%m/%y} · {fila['hora_inicio']}"
+        cambios, anteriores, error = preparar_cambios(fila, despues.loc[id_])
+        if error:
+            errores.append(f"{etiqueta}: {error}")
+            continue
+        if not cambios:
+            continue
+        try:
+            respuesta = cliente.table(SUPABASE_TABLA).update(cambios).eq("id", int(id_)).execute()
+        except Exception as fallo:
+            errores.append(f"{etiqueta}: {_traducir_error(fallo)}")
+            continue
+        # Si la política no deja actualizar, PostgREST no da error: devuelve
+        # cero filas. Hay que mirarlo para no reportar como guardado algo que no.
+        if not respuesta.data:
+            errores.append(f"{etiqueta}: la base no aplicó el cambio. Revise la política UPDATE.")
+            continue
+        guardados += 1
+        bitacora = [
+            {
+                "registro_id": int(id_),
+                "id_registro": fila["id_registro"],
+                "campo": campo,
+                "valor_anterior": None if _nulo(anteriores[campo]) else str(anteriores[campo]),
+                "valor_nuevo": None if _nulo(valor) else str(valor),
+            }
+            for campo, valor in cambios.items()
+        ]
+        try:
+            cliente.table(EDICIONES_TABLA).insert(bitacora).execute()
+        except Exception as fallo:
+            errores.append(f"{etiqueta}: se guardó, pero no quedó en la bitácora ({_traducir_error(fallo)}).")
+    return guardados, errores
+
+
+def registrar_movimiento(usuario_id: str, token: str, ficha: str, colaborador: str,
+                         fecha, horas: float, motivo: str, observacion: str) -> str | None:
+    """Agrega un movimiento al banco de horas. Devuelve el error, o None si quedó."""
+    movimiento = {
+        "ficha": ficha,
+        "colaborador": colaborador,
+        "fecha": fecha.isoformat(),
+        "horas": round(abs(horas), 2) * MOTIVOS_BANCO[motivo]["signo"],
+        "motivo": motivo,
+        "observacion": observacion.strip() or None,
+    }
+    try:
+        respuesta = _cliente(usuario_id, token).table(BANCO_TABLA).insert(movimiento).execute()
+    except Exception as fallo:
+        return _traducir_error(fallo)
+    return None if respuesta.data else "La base no guardó el movimiento. Revise la política INSERT."
+
+
+def eliminar_movimiento(usuario_id: str, token: str, id_: int) -> str | None:
+    try:
+        respuesta = _cliente(usuario_id, token).table(BANCO_TABLA).delete().eq("id", id_).execute()
+    except Exception as fallo:
+        return _traducir_error(fallo)
+    return None if respuesta.data else "La base no eliminó el movimiento. Revise la política DELETE."
+
+
+def avisar_y_recargar(tipo: str, mensaje: str) -> None:
+    """Guarda el aviso para mostrarlo tras recargar: los datos cambiaron en la base."""
+    st.session_state["aviso"] = (tipo, mensaje)
+    st.cache_data.clear()
+    st.rerun()
 
 
 # --------------------------------------------------------------------------- #
@@ -999,6 +1223,14 @@ def _seleccion(clave: str, validas: list[str]) -> list[str]:
 clasificaciones = _seleccion("filtro_clasificacion", CLASIFICACIONES_DISPONIBLES)
 haciendas = _seleccion("filtro_hacienda", HACIENDAS_DISPONIBLES)
 
+# Filtro de horas adicionales: sin selección se ven todos los registros.
+FILTROS_ADICIONALES = {
+    "Con horas adicionales": lambda df: df["horas_adicionales"] > 0,
+    "Extra": lambda df: df["tipo_hora_adicional"] == NOMBRES_HORA_ADICIONAL["extra"],
+    "Banco de horas": lambda df: df["tipo_hora_adicional"] == NOMBRES_HORA_ADICIONAL["banco"],
+}
+filtro_adicional = st.session_state.get("filtro_adicionales")
+
 filtrados = datos.copy()
 if rango and isinstance(rango, (list, tuple)) and len(rango) == 2:
     desde, hasta = pd.Timestamp(rango[0]), pd.Timestamp(rango[1])
@@ -1020,6 +1252,8 @@ if solo_alertas:
     filtrados = filtrados[filtrados["tiene_alerta"]]
 if solo_herramienta:
     filtrados = filtrados[filtrados["herramientas_texto"] != ""]
+if filtro_adicional in FILTROS_ADICIONALES:
+    filtrados = filtrados[FILTROS_ADICIONALES[filtro_adicional](filtrados)]
 
 # Herramientas de los registros que quedaron tras los filtros.
 herramientas_filtradas = herramientas[herramientas["indice"].isin(filtrados.index)]
@@ -1034,19 +1268,21 @@ st.caption(
     )
 )
 
-if filtrados.empty:
-    st.warning("Ningún registro cumple los filtros seleccionados.")
-    st.stop()
+# El aviso queda guardado antes de recargar tras una edición; se muestra una vez.
+if "aviso" in st.session_state:
+    tipo_aviso, texto_aviso = st.session_state.pop("aviso")
+    getattr(st, tipo_aviso)(texto_aviso)
 
-columnas_kpi = st.columns(6)
-columnas_kpi[0].metric("Registros", f"{len(filtrados):,}".replace(",", "."))
-columnas_kpi[1].metric("Horas", f"{filtrados['horas_totales'].sum():,.1f}")
-columnas_kpi[2].metric("Horas adicionales", f"{filtrados['horas_adicionales'].sum():,.1f}")
-columnas_kpi[3].metric("Colaboradores", filtrados["ficha"].nunique())
-columnas_kpi[4].metric("Horas herramienta", f"{herramientas_filtradas['herramienta_horas'].sum():,.1f}")
-columnas_kpi[5].metric("Con alerta", int(filtrados["tiene_alerta"].sum()))
+if not filtrados.empty:
+    columnas_kpi = st.columns(6)
+    columnas_kpi[0].metric("Registros", f"{len(filtrados):,}".replace(",", "."))
+    columnas_kpi[1].metric("Horas", f"{filtrados['horas_totales'].sum():,.1f}")
+    columnas_kpi[2].metric("Horas adicionales", f"{filtrados['horas_adicionales'].sum():,.1f}")
+    columnas_kpi[3].metric("Colaboradores", filtrados["ficha"].nunique())
+    columnas_kpi[4].metric("Horas herramienta", f"{herramientas_filtradas['herramienta_horas'].sum():,.1f}")
+    columnas_kpi[5].metric("Con alerta", int(filtrados["tiene_alerta"].sum()))
 
-col_clasificacion, col_hacienda = st.columns(2)
+col_clasificacion, col_hacienda, col_adicionales = st.columns([1, 1, 1.2])
 col_clasificacion.multiselect(
     "Clasificación",
     CLASIFICACIONES_DISPONIBLES,
@@ -1062,14 +1298,26 @@ col_hacienda.multiselect(
     placeholder="Todas las haciendas",
     help="Aplica a todas las vistas.",
 )
+col_adicionales.segmented_control(
+    "Horas adicionales",
+    list(FILTROS_ADICIONALES),
+    key="filtro_adicionales",
+    help="Sin selección se ven todos los registros. Haga clic de nuevo en la opción "
+    "activa para quitar el filtro.",
+)
 
 # Un selector en lugar de pestañas: con st.tabs, Streamlit construye y envía
 # todas las vistas en cada interacción. Dibujando sólo la activa, cada cambio de
 # filtro manda una fracción de lo que mandaba.
-VISTAS = ["Detalle", "Resumen", "Vacaciones", "Calidad de datos"]
+VISTAS = ["Detalle", "Resumen", "Banco de horas", "Vacaciones", "Calidad de datos"]
 vista_activa = st.segmented_control(
     "Vista", VISTAS, default="Detalle", key="vista", label_visibility="collapsed"
 ) or "Detalle"
+
+# El banco de horas tiene sus propios datos: no depende de que haya registros filtrados.
+if filtrados.empty and vista_activa != "Banco de horas":
+    st.warning("Ningún registro cumple los filtros seleccionados.")
+    st.stop()
 
 if vista_activa == "Resumen":
     por_clasificacion = filtrados.groupby("clasificacion", as_index=False)["horas_totales"].sum()
@@ -1155,16 +1403,98 @@ if vista_activa == "Resumen":
     st.dataframe(tabla_colaborador, hide_index=True, width="stretch")
 
 if vista_activa == "Detalle":
-    st.subheader("Registros")
+    titulo_detalle, interruptor_edicion = st.columns([3, 1], vertical_alignment="bottom")
+    titulo_detalle.subheader("Registros")
+    editando = interruptor_edicion.toggle(
+        "Editar registros",
+        key="modo_edicion",
+        help="Permite corregir el horario y las horas adicionales. Cada cambio queda "
+        "en la bitácora con el usuario que lo hizo.",
+    )
     columnas_detalle = [c for c in ORDEN_COLUMNAS if c in filtrados.columns] + ["created_at"]
     vista = para_mostrar(filtrados, columnas_detalle)
-    st.dataframe(
-        vista,
-        hide_index=True,
-        width="stretch",
-        height=520,
-        column_config=CONFIG_COLUMNAS,
-    )
+
+    if not editando:
+        st.dataframe(
+            vista,
+            hide_index=True,
+            width="stretch",
+            height=520,
+            column_config=CONFIG_COLUMNAS,
+        )
+    else:
+        st.caption(
+            "Edite **Hora inicio**, **Hora fin**, **Horas adicionales** y **Tipo hora "
+            "adicional**. Las horas del registro y las normales se recalculan solas al "
+            "guardar. Los cambios no llegan a la base hasta que pulse *Guardar cambios*."
+        )
+        antes = filtrados.set_index("id")
+        columnas_edicion = [
+            "fecha", "ficha", "colaborador", "clasificacion", "actividad", "hacienda_nombre",
+            "hora_inicio", "hora_fin", "horas_totales", "horas_normales",
+            "horas_adicionales", "tipo_hora_adicional",
+        ]
+        base_edicion = antes[columnas_edicion].copy()
+        base_edicion["tipo_hora_adicional"] = base_edicion["tipo_hora_adicional"].replace("", None)
+
+        hora = dict(validate=FORMATO_HORA.pattern, required=True, width="small")
+        # Las claves de la tabla de edición son los nombres de columna originales,
+        # para comparar contra `antes` sin traducir etiquetas.
+        configuracion_edicion = {
+            columna: st.column_config.Column(ETIQUETAS[columna], disabled=True)
+            for columna in columnas_edicion
+        } | {
+            "fecha": st.column_config.DateColumn(ETIQUETAS["fecha"], format="DD/MM/YY", disabled=True),
+            "hora_inicio": st.column_config.TextColumn(ETIQUETAS["hora_inicio"], **hora),
+            "hora_fin": st.column_config.TextColumn(ETIQUETAS["hora_fin"], **hora),
+            "horas_adicionales": st.column_config.NumberColumn(
+                ETIQUETAS["horas_adicionales"], min_value=0, max_value=24, step=0.25,
+                format="%.2f", required=True,
+            ),
+            "tipo_hora_adicional": st.column_config.SelectboxColumn(
+                ETIQUETAS["tipo_hora_adicional"], options=list(NOMBRES_HORA_ADICIONAL.values()),
+            ),
+        }
+        # La clave cambia tras cada guardado: el editor recuerda los cambios por
+        # posición de fila y, con los datos recargados, los aplicaría a otra fila.
+        version = st.session_state.get("version_editor", 0)
+        editadas = st.data_editor(
+            base_edicion,
+            key=f"editor_registros_{version}",
+            hide_index=True,
+            width="stretch",
+            height=520,
+            column_config=configuracion_edicion,
+        )
+
+        pendientes = sum(
+            any(not _iguales(antes.at[i, c], editadas.at[i, c]) for c in COLUMNAS_EDITABLES)
+            for i in editadas.index
+        )
+        guardar, descartar, _ = st.columns([1, 1, 3])
+        if descartar.button("Descartar cambios", width="stretch", disabled=not pendientes):
+            st.session_state["version_editor"] = version + 1
+            st.rerun()
+        if guardar.button(
+            f"Guardar cambios ({pendientes})" if pendientes else "Guardar cambios",
+            width="stretch",
+            disabled=not pendientes,
+        ):
+            with st.spinner("Guardando en la base de datos…"):
+                guardados, errores = guardar_ediciones(
+                    antes, editadas, st.session_state["sesion"]["id"], token
+                )
+            if guardados:
+                st.session_state["version_editor"] = version + 1
+                mensaje = f"Se guardaron {guardados} registro(s)."
+                if errores:
+                    mensaje += " No se pudieron guardar:\n\n" + "\n".join(f"- {e}" for e in errores)
+                avisar_y_recargar("warning" if errores else "success", mensaje)
+            # Sin nada guardado no se recarga, para no perder lo que se editó.
+            if errores:
+                st.error("No se guardó ningún cambio:\n\n" + "\n".join(f"- {e}" for e in errores))
+            else:
+                st.info("Los valores editados son iguales a los guardados: no hay nada que cambiar.")
 
     # El Excel lleva además una hoja con cada herramienta en su propia fila, que
     # es como se digita el uso de equipos.
@@ -1195,6 +1525,184 @@ if vista_activa == "Detalle":
         file_name="actividades_ing_civil.csv",
         mime="text/csv",
     )
+
+if vista_activa == "Banco de horas":
+    banco = obtener_banco(usuario_id, token)
+    if banco is None:
+        st.info(
+            f"No se pudo leer «{BANCO_TABLA}». Si aún no existe, ejecute "
+            "`supabase_edicion_banco.sql` en el SQL Editor de Supabase."
+        )
+        st.stop()
+
+    # Colaboradores conocidos: los que reporta el bot y los que ya tienen
+    # movimientos. Si el nombre cambió, prevalece el del bot.
+    personas = (
+        pd.concat([datos[["ficha", "colaborador"]], banco[["ficha", "colaborador"]]])
+        .query("ficha != ''")
+        .drop_duplicates("ficha")
+        .sort_values("colaborador")
+    )
+    nombres = dict(zip(personas["ficha"], personas["colaborador"]))
+    fichas_visibles = (
+        set(personas.loc[personas["colaborador"].isin(colaboradores), "ficha"])
+        if colaboradores else set(personas["ficha"])
+    )
+
+    with st.container(border=True):
+        st.markdown("**Registrar movimiento**")
+        with st.form("movimiento_banco", clear_on_submit=True, border=False):
+            col_persona, col_fecha, col_horas = st.columns([2, 1, 1])
+            ficha_mov = col_persona.selectbox(
+                "Colaborador",
+                list(nombres),
+                index=None,
+                format_func=lambda f: f"{nombres[f]} ({f})",
+                placeholder="Escriba para buscar",
+            )
+            fecha_mov = col_fecha.date_input(
+                "Fecha",
+                # Hoy en Colombia (UTC-5), igual que la fecha de digitación.
+                value=(pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=5)).date(),
+                format="DD/MM/YYYY",
+            )
+            horas_mov = col_horas.number_input(
+                "Horas", min_value=0.25, max_value=24.0, value=JORNADA_HORAS, step=0.25
+            )
+            motivo_mov = st.radio(
+                "Movimiento",
+                list(MOTIVOS_BANCO),
+                format_func=lambda m: MOTIVOS_BANCO[m]["nombre"],
+                captions=[m["detalle"] for m in MOTIVOS_BANCO.values()],
+                horizontal=True,
+            )
+            observacion_mov = st.text_input("Observación", placeholder="Opcional")
+            registrar = st.form_submit_button("Registrar movimiento")
+        if registrar:
+            if not ficha_mov:
+                st.error("Elija el colaborador.")
+            else:
+                error = registrar_movimiento(
+                    usuario_id, token, ficha_mov, nombres[ficha_mov], fecha_mov,
+                    horas_mov, motivo_mov, observacion_mov,
+                )
+                if error:
+                    st.error(f"No se registró el movimiento: {error}")
+                else:
+                    signo = "+" if MOTIVOS_BANCO[motivo_mov]["signo"] > 0 else "−"
+                    avisar_y_recargar(
+                        "success",
+                        f"Movimiento registrado: {signo}{horas_mov:g} h a {nombres[ficha_mov]}.",
+                    )
+
+    # Saldo: sólo los movimientos manuales. Las horas que el bot reporta como
+    # banco se muestran aparte y no se suman, porque su signo frente a estos
+    # movimientos aún no está definido.
+    reportado_bot = (
+        datos[datos["tipo_hora_adicional"] == NOMBRES_HORA_ADICIONAL["banco"]]
+        .groupby("ficha")["horas_adicionales"].sum()
+    )
+    saldos = (
+        banco.groupby("ficha")["horas"]
+        .agg(
+            sumadas=lambda h: h[h > 0].sum(),
+            restadas=lambda h: -h[h < 0].sum(),
+            saldo="sum",
+        )
+        .join(banco.groupby("ficha")["fecha"].max().rename("ultimo"))
+        .join(reportado_bot.rename("reportado_bot"), how="outer")
+        .fillna({"sumadas": 0, "restadas": 0, "saldo": 0, "reportado_bot": 0})
+        .reset_index()
+    )
+    saldos = saldos[saldos["ficha"].isin(fichas_visibles)]
+    saldos.insert(1, "colaborador", saldos["ficha"].map(nombres))
+
+    st.subheader("Saldo por colaborador")
+    if saldos.empty:
+        st.info("Todavía no hay movimientos en el banco de horas.")
+    else:
+        kpi_1, kpi_2, kpi_3 = st.columns(3)
+        kpi_1.metric("Horas sumadas", f"{saldos['sumadas'].sum():,.2f}")
+        kpi_2.metric("Horas restadas", f"{saldos['restadas'].sum():,.2f}")
+        kpi_3.metric("Saldo", f"{saldos['saldo'].sum():+,.2f}")
+
+        tabla_saldos = saldos.sort_values("saldo", ascending=False).rename(columns={
+            "ficha": "Ficha",
+            "colaborador": "Colaborador",
+            "sumadas": "Sumadas (+)",
+            "restadas": "Restadas (−)",
+            "saldo": "Saldo",
+            "ultimo": "Último movimiento",
+            "reportado_bot": "Banco reportado por el bot",
+        })
+        st.dataframe(
+            tabla_saldos,
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "Saldo": st.column_config.NumberColumn("Saldo", format="%+.2f"),
+                "Último movimiento": st.column_config.DateColumn(
+                    "Último movimiento", format="DD/MM/YY"
+                ),
+                "Banco reportado por el bot": st.column_config.NumberColumn(
+                    "Banco reportado por el bot",
+                    help="Horas adicionales que el bot registró como banco de horas. "
+                    "Se muestran como referencia y no entran en el saldo.",
+                ),
+            },
+        )
+        st.caption("El saldo es histórico: no depende del rango de fechas.")
+
+    st.subheader("Movimientos")
+    movimientos = banco[banco["ficha"].isin(fichas_visibles)]
+    if desde is not None:
+        movimientos = movimientos[movimientos["fecha"].between(desde, hasta)]
+    if movimientos.empty:
+        st.info("No hay movimientos en el rango de fechas seleccionado.")
+    else:
+        tabla_movimientos = para_mostrar(
+            movimientos,
+            ["fecha", "ficha", "colaborador", "movimiento", "horas", "observacion",
+             "registrado_por", "created_at"],
+        )
+        seleccion = st.dataframe(
+            tabla_movimientos,
+            hide_index=True,
+            width="stretch",
+            column_config=CONFIG_COLUMNAS | {
+                ETIQUETAS["horas"]: st.column_config.NumberColumn(ETIQUETAS["horas"], format="%+.2f"),
+            },
+            on_select="rerun",
+            selection_mode="single-row",
+            key="tabla_movimientos",
+        )
+        filas = seleccion.selection.rows
+        if filas:
+            elegido = movimientos.iloc[filas[0]]
+            st.markdown(
+                f"Movimiento seleccionado: **{elegido['colaborador']}**, "
+                f"{elegido['fecha']:%d/%m/%y}, **{elegido['horas']:+g} h**."
+            )
+            confirmar, eliminar, _ = st.columns([2, 1, 2], vertical_alignment="center")
+            seguro = confirmar.checkbox("Confirmo que quiero eliminarlo")
+            if eliminar.button("Eliminar movimiento", width="stretch", disabled=not seguro):
+                error = eliminar_movimiento(usuario_id, token, int(elegido["id"]))
+                if error:
+                    st.error(f"No se eliminó: {error}")
+                else:
+                    avisar_y_recargar("success", "Movimiento eliminado.")
+        else:
+            st.caption("Seleccione un movimiento en la tabla si necesita eliminarlo.")
+
+        st.download_button(
+            "Descargar Excel",
+            a_excel({
+                "Saldos": para_exportar(tabla_saldos) if not saldos.empty else pd.DataFrame(),
+                "Movimientos": para_exportar(tabla_movimientos),
+            }),
+            file_name="banco_horas_ing_civil.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
 if vista_activa == "Vacaciones":
     st.subheader("Vacaciones")
