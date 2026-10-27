@@ -350,12 +350,18 @@ verifica (`chk_banco_motivo`):
 | `asistencia_sin_reporte` | − | Viene a trabajar el día completo y no se le reportan actividades. |
 
 La vista muestra el saldo por colaborador (histórico, no depende del rango de
-fechas), los movimientos del rango y permite eliminar uno seleccionándolo en la
-tabla y confirmando.
+fechas), los movimientos del rango y permite eliminar un movimiento manual
+seleccionándolo en la tabla y confirmando.
 
-Las horas adicionales que el bot registra como *banco* aparecen en la columna
-*Banco reportado por el bot* **sin sumarse al saldo**: falta definir con qué
-signo entran frente a los movimientos manuales.
+Las horas adicionales que el bot registra como *banco de horas* **suman al
+saldo automáticamente** (columna *Bot (+)*). No se copian a `civil_banco_horas`:
+se leen del registro cada vez, así que si el colaborador se equivocó basta
+corregir el registro en Detalle y el saldo se ajusta solo. En el historial
+aparecen con origen *Bot* y no se pueden eliminar desde ahí. Las de tipo
+*extra* se pagan y no entran al banco.
+
+El saldo queda: `Bot (+)` + `Manual (+)` − `Restadas (−)`. Si la tabla de
+movimientos no se puede leer, la vista sigue mostrando lo del bot y avisa.
 
 ---
 

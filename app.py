@@ -130,6 +130,7 @@ ETIQUETAS = {
     "movimiento": "Movimiento",
     "observacion": "Observación",
     "registrado_por": "Registrado por",
+    "origen": "Origen",
 }
 
 FORMATO_FECHA = "%d/%m/%y"  # DD/MM/AA, igual en fecha y fecha de digitación
@@ -509,6 +510,10 @@ def obtener_banco(usuario_id: str, token: str) -> pd.DataFrame | None:
         banco = cargar_banco(BANCO_TABLA, usuario_id, token)
     except Exception:
         return None
+    return normalizar_banco(banco)
+
+
+def normalizar_banco(banco: pd.DataFrame) -> pd.DataFrame:
     columnas = COLUMNAS_BANCO.split(",")
     banco = banco.reindex(columns=columnas) if not banco.empty else pd.DataFrame(columns=columnas)
     banco["fecha"] = _a_fecha(banco["fecha"])
@@ -1529,11 +1534,13 @@ if vista_activa == "Detalle":
 if vista_activa == "Banco de horas":
     banco = obtener_banco(usuario_id, token)
     if banco is None:
-        st.info(
-            f"No se pudo leer «{BANCO_TABLA}». Si aún no existe, ejecute "
-            "`supabase_edicion_banco.sql` en el SQL Editor de Supabase."
+        # Sin la tabla de movimientos el saldo sigue mostrando lo que reportó el bot.
+        st.warning(
+            f"No se pudo leer «{BANCO_TABLA}»: sólo se muestran las horas que reportó el "
+            "bot. Si la tabla aún no existe, ejecute `supabase_edicion_banco.sql` en el "
+            "SQL Editor de Supabase."
         )
-        st.stop()
+        banco = normalizar_banco(pd.DataFrame())
 
     # Colaboradores conocidos: los que reporta el bot y los que ya tienen
     # movimientos. Si el nombre cambió, prevalece el del bot.
@@ -1595,23 +1602,39 @@ if vista_activa == "Banco de horas":
                         f"Movimiento registrado: {signo}{horas_mov:g} h a {nombres[ficha_mov]}.",
                     )
 
-    # Saldo: sólo los movimientos manuales. Las horas que el bot reporta como
-    # banco se muestran aparte y no se suman, porque su signo frente a estos
-    # movimientos aún no está definido.
-    reportado_bot = (
-        datos[datos["tipo_hora_adicional"] == NOMBRES_HORA_ADICIONAL["banco"]]
-        .groupby("ficha")["horas_adicionales"].sum()
-    )
+    # Las horas adicionales que el bot registra como banco suman al saldo por sí
+    # solas. No se copian a civil_banco_horas: se leen del registro, así que si
+    # el colaborador se equivocó basta corregir el registro en Detalle.
+    del_bot = datos[datos["tipo_hora_adicional"] == NOMBRES_HORA_ADICIONAL["banco"]]
+    del_bot = pd.DataFrame({
+        "id": pd.NA,
+        "ficha": del_bot["ficha"],
+        "colaborador": del_bot["colaborador"],
+        "fecha": del_bot["fecha"],
+        "horas": del_bot["horas_adicionales"],
+        "movimiento": "Horas adicionales reportadas (+)",
+        "observacion": del_bot["actividad"],
+        "registrado_por": "Bot",
+        "created_at": del_bot["created_at"],
+        "origen": "Bot",
+    })
+    todos = pd.concat([banco.assign(origen="Manual"), del_bot], ignore_index=True)
+    es_bot = todos["origen"] == "Bot"
+
     saldos = (
-        banco.groupby("ficha")["horas"]
-        .agg(
-            sumadas=lambda h: h[h > 0].sum(),
-            restadas=lambda h: -h[h < 0].sum(),
-            saldo="sum",
+        todos.assign(
+            bot=todos["horas"].where(es_bot, 0),
+            sumadas=todos["horas"].where(~es_bot & (todos["horas"] > 0), 0),
+            restadas=-todos["horas"].where(~es_bot & (todos["horas"] < 0), 0),
         )
-        .join(banco.groupby("ficha")["fecha"].max().rename("ultimo"))
-        .join(reportado_bot.rename("reportado_bot"), how="outer")
-        .fillna({"sumadas": 0, "restadas": 0, "saldo": 0, "reportado_bot": 0})
+        .groupby("ficha")
+        .agg(
+            bot=("bot", "sum"),
+            sumadas=("sumadas", "sum"),
+            restadas=("restadas", "sum"),
+            saldo=("horas", "sum"),
+            ultimo=("fecha", "max"),
+        )
         .reset_index()
     )
     saldos = saldos[saldos["ficha"].isin(fichas_visibles)]
@@ -1621,19 +1644,20 @@ if vista_activa == "Banco de horas":
     if saldos.empty:
         st.info("Todavía no hay movimientos en el banco de horas.")
     else:
-        kpi_1, kpi_2, kpi_3 = st.columns(3)
-        kpi_1.metric("Horas sumadas", f"{saldos['sumadas'].sum():,.2f}")
-        kpi_2.metric("Horas restadas", f"{saldos['restadas'].sum():,.2f}")
-        kpi_3.metric("Saldo", f"{saldos['saldo'].sum():+,.2f}")
+        kpi_1, kpi_2, kpi_3, kpi_4 = st.columns(4)
+        kpi_1.metric("Reportadas por el bot", f"{saldos['bot'].sum():,.2f}")
+        kpi_2.metric("Sumadas a mano", f"{saldos['sumadas'].sum():,.2f}")
+        kpi_3.metric("Restadas", f"{saldos['restadas'].sum():,.2f}")
+        kpi_4.metric("Saldo", f"{saldos['saldo'].sum():+,.2f}")
 
         tabla_saldos = saldos.sort_values("saldo", ascending=False).rename(columns={
             "ficha": "Ficha",
             "colaborador": "Colaborador",
-            "sumadas": "Sumadas (+)",
+            "bot": "Bot (+)",
+            "sumadas": "Manual (+)",
             "restadas": "Restadas (−)",
             "saldo": "Saldo",
             "ultimo": "Último movimiento",
-            "reportado_bot": "Banco reportado por el bot",
         })
         st.dataframe(
             tabla_saldos,
@@ -1644,17 +1668,17 @@ if vista_activa == "Banco de horas":
                 "Último movimiento": st.column_config.DateColumn(
                     "Último movimiento", format="DD/MM/YY"
                 ),
-                "Banco reportado por el bot": st.column_config.NumberColumn(
-                    "Banco reportado por el bot",
+                "Bot (+)": st.column_config.NumberColumn(
+                    "Bot (+)",
                     help="Horas adicionales que el bot registró como banco de horas. "
-                    "Se muestran como referencia y no entran en el saldo.",
+                    "Para corregirlas, edite el registro en la vista Detalle.",
                 ),
             },
         )
         st.caption("El saldo es histórico: no depende del rango de fechas.")
 
     st.subheader("Movimientos")
-    movimientos = banco[banco["ficha"].isin(fichas_visibles)]
+    movimientos = todos[todos["ficha"].isin(fichas_visibles)]
     if desde is not None:
         movimientos = movimientos[movimientos["fecha"].between(desde, hasta)]
     if movimientos.empty:
@@ -1662,7 +1686,7 @@ if vista_activa == "Banco de horas":
     else:
         tabla_movimientos = para_mostrar(
             movimientos,
-            ["fecha", "ficha", "colaborador", "movimiento", "horas", "observacion",
+            ["fecha", "ficha", "colaborador", "origen", "movimiento", "horas", "observacion",
              "registrado_por", "created_at"],
         )
         seleccion = st.dataframe(
@@ -1677,8 +1701,14 @@ if vista_activa == "Banco de horas":
             key="tabla_movimientos",
         )
         filas = seleccion.selection.rows
-        if filas:
-            elegido = movimientos.iloc[filas[0]]
+        elegido = movimientos.iloc[filas[0]] if filas else None
+        if elegido is not None and elegido["origen"] == "Bot":
+            st.info(
+                "Este movimiento viene de un registro del bot. Para corregirlo, edite las "
+                "horas adicionales de ese registro en la vista **Detalle**: el saldo se "
+                "ajusta solo."
+            )
+        elif elegido is not None:
             st.markdown(
                 f"Movimiento seleccionado: **{elegido['colaborador']}**, "
                 f"{elegido['fecha']:%d/%m/%y}, **{elegido['horas']:+g} h**."
@@ -1692,7 +1722,9 @@ if vista_activa == "Banco de horas":
                 else:
                     avisar_y_recargar("success", "Movimiento eliminado.")
         else:
-            st.caption("Seleccione un movimiento en la tabla si necesita eliminarlo.")
+            st.caption(
+                "Seleccione un movimiento manual en la tabla si necesita eliminarlo."
+            )
 
         st.download_button(
             "Descargar Excel",
